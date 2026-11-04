@@ -136,7 +136,8 @@ impl APIClient for VolcMinerV1 {
             MinerCommand::RPC { .. } => self.rpc.get_api_result(command).await,
             MinerCommand::WebAPI { .. } => self.web.get_api_result(command).await,
             _ => Err(anyhow::anyhow!(
-                "Unsupported command type for VolcMiner API"
+                "Unsupported command type for {} API",
+                VolcMinerStockFirmware::default()
             )),
         }
     }
@@ -251,7 +252,25 @@ impl GetDataLocations for VolcMinerV1 {
                     tag: None,
                 },
             )],
-            DataField::Hashrate | DataField::IsMining => vec![
+            DataField::Hashrate => vec![
+                (
+                    WEB_MINER_STATUS,
+                    DataExtractor {
+                        func: get_by_pointer,
+                        key: Some("/summary"),
+                        tag: None,
+                    },
+                ),
+                (
+                    RPC_SUMMARY,
+                    DataExtractor {
+                        func: get_by_pointer,
+                        key: Some("/SUMMARY/0"),
+                        tag: None,
+                    },
+                ),
+            ],
+            DataField::IsMining => vec![
                 (
                     WEB_MINER_STATUS,
                     DataExtractor {
@@ -287,7 +306,25 @@ impl GetDataLocations for VolcMinerV1 {
                     },
                 ),
             ],
-            DataField::Fans | DataField::Hashboards => vec![
+            DataField::Fans => vec![
+                (
+                    WEB_MINER_STATUS,
+                    DataExtractor {
+                        func: get_by_pointer,
+                        key: Some(""),
+                        tag: None,
+                    },
+                ),
+                (
+                    RPC_STATS,
+                    DataExtractor {
+                        func: get_by_pointer,
+                        key: Some("/STATS/1"),
+                        tag: None,
+                    },
+                ),
+            ],
+            DataField::Hashboards => vec![
                 (
                     WEB_MINER_STATUS,
                     DataExtractor {
@@ -398,7 +435,7 @@ impl GetHashboards for VolcMinerV1 {
                     .map(|rate| HashRate {
                         value: rate,
                         unit: HashRateUnit::MegaHash,
-                        algo: "Scrypt".to_string(),
+                        algo: self.device_info.algo,
                     });
 
                 let temperature = stats_data
@@ -465,7 +502,7 @@ impl GetHashboards for VolcMinerV1 {
                 .map(|rate| HashRate {
                     value: rate,
                     unit: HashRateUnit::MegaHash,
-                    algo: "Scrypt".to_string(),
+                    algo: self.device_info.algo,
                 });
             let active = board
                 .working_chips
@@ -490,7 +527,7 @@ impl GetHashrate for VolcMinerV1 {
         Some(HashRate {
             value: hashrate,
             unit: HashRateUnit::MegaHash,
-            algo: "Scrypt".to_string(),
+            algo: self.device_info.algo,
         })
     }
 }
@@ -528,6 +565,13 @@ impl GetUptime for VolcMinerV1 {
             .map(Duration::from_secs)
     }
 }
+
+impl GetBestShare for VolcMinerV1 {}
+impl GetSessionBestShare for VolcMinerV1 {}
+
+impl GetOperatingState for VolcMinerV1 {}
+
+impl GetDevFeeConnected for VolcMinerV1 {}
 
 impl GetIsMining for VolcMinerV1 {
     fn parse_is_mining(&self, data: &HashMap<DataField, Value>) -> bool {
@@ -599,6 +643,10 @@ impl GetPools for VolcMinerV1 {
                 url,
                 accepted_shares,
                 rejected_shares,
+                last_share_time: pool_info
+                    .get("Last Share Time")
+                    .or_else(|| pool_info.get("last_share_time"))
+                    .and_then(asic_rs_core::util::parse_last_share_time),
                 active: status,
                 alive: status,
                 user,
@@ -630,6 +678,7 @@ impl GetTuningTarget for VolcMinerV1 {}
 impl GetScaledTuningTarget for VolcMinerV1 {}
 impl GetFluidTemperature for VolcMinerV1 {}
 impl GetPsuFans for VolcMinerV1 {}
+impl GetPsus for VolcMinerV1 {}
 impl GetTuningCapabilities for VolcMinerV1 {}
 impl GetMessages for VolcMinerV1 {}
 
@@ -785,6 +834,9 @@ impl FactoryReset for VolcMinerV1 {
     }
 }
 
+impl RestartMining for VolcMinerV1 {}
+impl RestoreStockOs for VolcMinerV1 {}
+
 #[async_trait]
 impl SupportsScalingConfig for VolcMinerV1 {
     fn supports_scaling_config(&self) -> bool {
@@ -817,7 +869,11 @@ impl SupportsTuningConfig for VolcMinerV1 {}
 impl SupportsFanConfig for VolcMinerV1 {}
 
 impl SupportsTemperatureConfig for VolcMinerV1 {}
+impl SupportsPresets for VolcMinerV1 {}
+impl SupportsTimezoneConfig for VolcMinerV1 {}
 impl GetTuningPercent for VolcMinerV1 {}
+impl SetHashboardsEnabled for VolcMinerV1 {}
+
 impl SetTuningPercent for VolcMinerV1 {}
 
 #[cfg(test)]

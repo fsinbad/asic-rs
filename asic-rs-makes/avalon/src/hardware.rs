@@ -1,6 +1,7 @@
 use asic_rs_core::data::{board::MinerControlBoard, collector::FromValue, device::MinerHardware};
 use serde::{Deserialize, Serialize};
 use strum::Display;
+use ts_rs::TS;
 
 use crate::models::AvalonMinerModel;
 
@@ -67,6 +68,10 @@ impl From<AvalonMinerModel> for MinerHardware {
                 boards: Some(vec![Some(160), Some(160), Some(160)]),
                 fans: Some(2),
             },
+            AvalonMinerModel::Avalon15Xp => Self {
+                boards: Some(vec![Some(160), Some(160), Some(160)]),
+                fans: Some(2),
+            },
             AvalonMinerModel::Avalon1566 => Self {
                 boards: Some(vec![Some(160), Some(160), Some(160)]),
                 fans: Some(2),
@@ -96,7 +101,7 @@ impl From<AvalonMinerModel> for MinerHardware {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Hash, Serialize, Deserialize, Display)]
+#[derive(Debug, PartialEq, Eq, Clone, Hash, Serialize, Deserialize, Display, TS)]
 pub enum AvalonMinerControlBoard {
     #[serde(rename = "MM3v2X3")]
     MM3v2X3,

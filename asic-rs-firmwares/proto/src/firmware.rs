@@ -1,7 +1,7 @@
 use std::{fmt::Display, net::IpAddr};
 
 use asic_rs_core::{
-    data::command::MinerCommand,
+    data::command::DiscoveryCommand,
     discovery::HTTP_WEB_ROOT,
     errors::ModelSelectionError,
     traits::{
@@ -31,16 +31,16 @@ impl Display for ProtoFirmware {
 }
 
 impl DiscoveryCommands for ProtoFirmware {
-    fn get_discovery_commands(&self) -> Vec<MinerCommand> {
+    fn get_discovery_commands(&self) -> Vec<DiscoveryCommand> {
         vec![HTTP_WEB_ROOT]
     }
 }
 
 #[async_trait]
 impl MinerFirmware for ProtoFirmware {
-    async fn get_model(
-        ip: IpAddr,
-    ) -> Result<impl asic_rs_core::traits::model::MinerModel, ModelSelectionError> {
+    type Model = asic_rs_makes_proto::models::ProtoModel;
+
+    async fn get_model(ip: IpAddr) -> Result<Self::Model, ModelSelectionError> {
         let (body, _, _) = send_web_command(&ip, WEB_SYSTEM)
             .await
             .ok_or(ModelSelectionError::NoModelResponse)?;

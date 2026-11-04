@@ -66,6 +66,15 @@ fn normalized(value: &str) -> String {
     sanitize_name(value).to_ascii_lowercase()
 }
 
+fn normalized_product_model(value: &str) -> String {
+    let model = normalized(value);
+    model
+        .strip_prefix("antminer ")
+        .unwrap_or(&model)
+        .trim()
+        .to_string()
+}
+
 fn compact_normalized(value: &str) -> String {
     normalized(value)
         .chars()
@@ -93,13 +102,16 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> anyhow::Result<u32> {
 }
 
 async fn parse_bmu_entries(bytes: &[u8]) -> anyhow::Result<Option<Vec<BmuEntry>>> {
-    if bytes.len() < BMU_HEADER_SIZE {
+    if bytes.len() < std::mem::size_of::<u32>() {
         return Ok(None);
     }
 
     let magic = read_u32_le(bytes, 0)?;
     if magic != BMU_MAGIC {
         return Ok(None);
+    }
+    if bytes.len() < BMU_HEADER_SIZE {
+        bail!("BMU header is truncated");
     }
 
     let header_size = read_u32_le(bytes, 8)? as usize;
@@ -211,33 +223,38 @@ fn decode_bmu_field(field: &[u8], len: usize) -> String {
 }
 
 fn candidate_score(entry: &BmuEntry, miner: &MinerTypeInfo) -> Option<u8> {
-    let model = normalized(&entry.model);
+    let model = normalized_product_model(&entry.model);
     let hardware = normalized(&entry.hardware);
     let chip = normalized(&entry.chip);
     let filename = normalized(&entry.filename);
-    let miner_model = normalized(&miner.model);
+    let miner_model = normalized_product_model(&miner.model);
     let miner_subtype = normalized(&miner.subtype);
 
+    let subtype_matches = !miner_subtype.is_empty()
+        && (hardware == miner_subtype
+            || chip == miner_subtype
+            || wildcard_compatible(&entry.hardware, &miner.subtype)
+            || wildcard_compatible(&entry.chip, &miner.subtype));
+
     if model != miner_model {
-        return None;
+        // Some stock releases report a generic control-board model (for example,
+        // "Antminer BHB42XXX") instead of the product name stored in the BMU. Only fall back
+        // to a different product label when the control-board subtype is a strong match.
+        return subtype_matches.then_some(4);
     }
 
     if miner_subtype.is_empty() {
-        Some(1)
-    } else if hardware == miner_subtype
-        || chip == miner_subtype
-        || wildcard_compatible(&entry.hardware, &miner.subtype)
-        || wildcard_compatible(&entry.chip, &miner.subtype)
-    {
-        Some(4)
+        Some(5)
+    } else if subtype_matches {
+        Some(8)
     } else if hardware.contains(&miner_subtype) || chip.contains(&miner_subtype) {
-        Some(3)
+        Some(7)
     } else if filename.contains(&miner_subtype) {
-        Some(2)
+        Some(6)
     } else if !hardware.is_empty() || !chip.is_empty() || filename.contains("ctrl") {
         None
     } else {
-        Some(1)
+        Some(5)
     }
 }
 
@@ -253,13 +270,26 @@ pub(super) async fn resolve_firmware_image(
             return Ok(FirmwareImage::new(filename, bytes));
         };
 
-        let best = entries
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, entry)| candidate_score(entry, miner).map(|score| (score, idx)))
-            .max_by_key(|(score, _)| *score)
-            .map(|(_, idx)| entries[idx].clone())
-            .context("No matching firmware image found in BMU bundle")?;
+        let mut best = None;
+        let mut ambiguous = false;
+        for (idx, entry) in entries.iter().enumerate() {
+            let Some(score) = candidate_score(entry, miner) else {
+                continue;
+            };
+            match best {
+                Some((best_score, _)) if score < best_score => {}
+                Some((best_score, _)) if score == best_score => ambiguous = true,
+                _ => {
+                    best = Some((score, idx));
+                    ambiguous = false;
+                }
+            }
+        }
+        let (_, best_idx) = best.context("No matching firmware image found in BMU bundle")?;
+        if ambiguous {
+            bail!("Ambiguous firmware images in BMU bundle for this miner");
+        }
+        let best = entries[best_idx].clone();
 
         let firmware = copy_firmware_range(&bytes, best.data).await?;
         image = FirmwareImage::new(best.filename, firmware);
@@ -408,6 +438,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bmu_matches_vendor_prefixed_model_without_subtype() {
+        let bmu = build_bmu(&[("s19.bin", "", "", "S19", b"matched")]);
+        let miner = MinerTypeInfo {
+            model: "Antminer S19".to_string(),
+            subtype: String::new(),
+        };
+
+        let resolved =
+            resolve_firmware_image(FirmwareImage::new("bundle.bmu".to_string(), bmu), &miner)
+                .await
+                .unwrap();
+        assert_eq!(resolved.bytes, b"matched");
+    }
+
+    #[tokio::test]
+    async fn bmu_rejects_multiple_model_matches_without_subtype() {
+        let bmu = build_bmu(&[
+            ("s19-zynq.bin", "Zynq7007", "Ctrl_Zynq", "S19", b"zynq"),
+            (
+                "s19-amlogic.bin",
+                "AMLogic",
+                "Ctrl_AMLogic",
+                "S19",
+                b"amlogic",
+            ),
+        ]);
+        let miner = MinerTypeInfo {
+            model: "Antminer S19".to_string(),
+            subtype: String::new(),
+        };
+
+        let error =
+            resolve_firmware_image(FirmwareImage::new("bundle.bmu".to_string(), bmu), &miner)
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("Ambiguous firmware images"));
+    }
+
+    #[tokio::test]
+    async fn bmu_uses_exact_subtype_when_miner_reports_generic_model() {
+        let bmu = build_bmu(&[
+            (
+                "s19j-pro-zynq.bmu",
+                "Zynq7007",
+                "Ctrl_BHB42XXX",
+                "Antminer S19j Pro",
+                b"wrong".as_slice(),
+            ),
+            (
+                "s19j-pro-amlogic.bmu",
+                "AMLogic",
+                "AMLCtrl_BHB42XXX",
+                "Antminer S19j Pro",
+                b"right".as_slice(),
+            ),
+        ]);
+        let miner = MinerTypeInfo {
+            model: "Antminer BHB42XXX".to_string(),
+            subtype: "AMLCtrl_BHB42XXX".to_string(),
+        };
+
+        let resolved =
+            resolve_firmware_image(FirmwareImage::new("bundle.bmu".to_string(), bmu), &miner)
+                .await
+                .unwrap();
+
+        assert_eq!(resolved.filename, "s19j-pro-amlogic.bmu");
+        assert_eq!(resolved.bytes, b"right");
+    }
+
+    #[tokio::test]
     async fn bmu_crc_mismatch_returns_error() {
         let mut bmu = build_bmu(&[("s21.bin", "X21", "X21", "S21", b"payload")]);
         bmu[24] ^= 0xFF;
@@ -415,6 +516,30 @@ mod tests {
         let err = parse_bmu_entries(&bmu).await.unwrap_err();
 
         assert!(err.to_string().contains("BMU CRC mismatch"));
+    }
+
+    #[tokio::test]
+    async fn bmu_malformed_or_truncated_header_returns_error() {
+        let mut truncated = vec![0_u8; BMU_HEADER_SIZE - 1];
+        write_u32_le(&mut truncated, 0, BMU_MAGIC);
+
+        let err = parse_bmu_entries(&truncated).await.unwrap_err();
+
+        assert!(err.to_string().contains("BMU header is truncated"));
+
+        let mut unsupported_header = build_bmu(&[("s21.bin", "X21", "X21", "S21", b"payload")]);
+        write_u32_le(&mut unsupported_header, 8, (BMU_HEADER_SIZE + 1) as u32);
+
+        let err = parse_bmu_entries(&unsupported_header).await.unwrap_err();
+
+        assert!(err.to_string().contains("Unsupported BMU header size"));
+
+        let mut unsupported_item = build_bmu(&[("s21.bin", "X21", "X21", "S21", b"payload")]);
+        write_u32_le(&mut unsupported_item, 16, (BMU_ITEM_FIXED_SIZE - 1) as u32);
+
+        let err = parse_bmu_entries(&unsupported_item).await.unwrap_err();
+
+        assert!(err.to_string().contains("Unsupported BMU item size"));
     }
 
     #[tokio::test]
@@ -439,5 +564,44 @@ mod tests {
         let err = parse_bmu_entries(&bmu).await.unwrap_err();
 
         assert!(err.to_string().contains("BMU payload exceeds file size"));
+    }
+
+    #[tokio::test]
+    async fn bmu_without_a_compatible_entry_returns_error() {
+        let bmu = build_bmu(&[("s19.bin", "X19", "X19", "S19", b"payload")]);
+        let miner = MinerTypeInfo {
+            model: "S21".to_string(),
+            subtype: "X21".to_string(),
+        };
+
+        let err = resolve_firmware_image(FirmwareImage::new("bundle.bmu".to_string(), bmu), &miner)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("No matching firmware image found in BMU bundle")
+        );
+    }
+
+    #[tokio::test]
+    async fn excessive_bmu_nesting_returns_error() {
+        let mut payload = b"firmware".to_vec();
+        for _ in 0..9 {
+            payload = build_bmu(&[("nested.bmu", "X21", "X21", "S21", payload.as_slice())]);
+        }
+        let miner = MinerTypeInfo {
+            model: "S21".to_string(),
+            subtype: "X21".to_string(),
+        };
+
+        let err = resolve_firmware_image(
+            FirmwareImage::new("bundle.bmu".to_string(), payload),
+            &miner,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("BMU nesting depth exceeded"));
     }
 }

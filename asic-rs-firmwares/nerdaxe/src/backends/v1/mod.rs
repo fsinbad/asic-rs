@@ -18,6 +18,7 @@ use asic_rs_core::{
         hashrate::{HashRate, HashRateUnit},
         message::{MessageSeverity, MinerMessage},
         pool::{PoolData, PoolGroupData, PoolScheme, PoolURL},
+        share::parse_share_difficulty,
     },
     traits::{miner::*, model::MinerModel},
     util::unix_timestamp_secs,
@@ -54,7 +55,10 @@ impl APIClient for NerdAxeV1 {
     async fn get_api_result(&self, command: &MinerCommand) -> anyhow::Result<Value> {
         match command {
             MinerCommand::WebAPI { .. } => self.web.get_api_result(command).await,
-            _ => Err(anyhow::anyhow!("Unsupported command type for NerdAxe API")),
+            _ => Err(anyhow::anyhow!(
+                "Unsupported command type for {} API",
+                NerdAxeFirmware::default()
+            )),
         }
     }
 }
@@ -193,6 +197,22 @@ impl GetDataLocations for NerdAxeV1 {
                     tag: None,
                 },
             )],
+            DataField::BestShare => vec![(
+                WEB_SYSTEM_INFO,
+                DataExtractor {
+                    func: get_by_key,
+                    key: Some("bestDiff"),
+                    tag: None,
+                },
+            )],
+            DataField::SessionBestShare => vec![(
+                WEB_SYSTEM_INFO,
+                DataExtractor {
+                    func: get_by_key,
+                    key: Some("bestSessionDiff"),
+                    tag: None,
+                },
+            )],
             _ => vec![],
         }
     }
@@ -223,6 +243,7 @@ impl GetMAC for NerdAxeV1 {
 }
 
 impl GetSerialNumber for NerdAxeV1 {}
+impl SupportsTimezoneConfig for NerdAxeV1 {}
 impl GetHostname for NerdAxeV1 {
     fn parse_hostname(&self, data: &HashMap<DataField, Value>) -> Option<String> {
         data.extract::<String>(DataField::Hostname)
@@ -260,9 +281,9 @@ impl GetHashboards for NerdAxeV1 {
             HashRate {
                 value: f,
                 unit: HashRateUnit::GigaHash,
-                algo: "SHA256".to_string(),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default())
+            .as_default_unit()
         });
         // `vrTemp` is the VR/board sensor; `temp` is the ASIC chip sensor.
         let chip_temp = api_data
@@ -303,9 +324,9 @@ impl GetHashboards for NerdAxeV1 {
                 HashRate {
                     value: core_count as f64 * chips as f64 * freq.as_gigahertz(),
                     unit: HashRateUnit::GigaHash,
-                    algo: "SHA256".to_string(),
+                    algo: self.device_info.algo,
                 }
-                .as_unit(HashRateUnit::default())
+                .as_default_unit()
             });
         if chip_data.is_some() {
             board.chips = vec![ChipData {
@@ -329,9 +350,9 @@ impl GetHashrate for NerdAxeV1 {
             HashRate {
                 value: f,
                 unit: HashRateUnit::GigaHash,
-                algo: "SHA256".to_string(),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default())
+            .as_default_unit()
         })
     }
 }
@@ -359,9 +380,9 @@ impl GetExpectedHashrate for NerdAxeV1 {
                         .unwrap_or(Frequency::from_megahertz(0f64))
                         .as_gigahertz(),
                 unit: HashRateUnit::GigaHash,
-                algo: "SHA256".to_string(),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default()),
+            .as_default_unit(),
         )
     }
 }
@@ -376,6 +397,7 @@ impl GetFans for NerdAxeV1 {
     }
 }
 impl GetPsuFans for NerdAxeV1 {}
+impl GetPsus for NerdAxeV1 {}
 impl GetFluidTemperature for NerdAxeV1 {}
 impl GetWattage for NerdAxeV1 {
     fn parse_wattage(&self, data: &HashMap<DataField, Value>) -> Option<Power> {
@@ -411,6 +433,24 @@ impl GetUptime for NerdAxeV1 {
         data.extract_map::<u64, _>(DataField::Uptime, Duration::from_secs)
     }
 }
+
+impl GetBestShare for NerdAxeV1 {
+    fn parse_best_share(&self, data: &HashMap<DataField, Value>) -> Option<f64> {
+        data.get(&DataField::BestShare)
+            .and_then(parse_share_difficulty)
+    }
+}
+
+impl GetSessionBestShare for NerdAxeV1 {
+    fn parse_session_best_share(&self, data: &HashMap<DataField, Value>) -> Option<f64> {
+        data.get(&DataField::SessionBestShare)
+            .and_then(parse_share_difficulty)
+    }
+}
+impl GetOperatingState for NerdAxeV1 {}
+
+impl GetDevFeeConnected for NerdAxeV1 {}
+
 impl GetIsMining for NerdAxeV1 {}
 impl GetPools for NerdAxeV1 {
     fn parse_pools(&self, data: &HashMap<DataField, Value>) -> Vec<PoolGroupData> {
@@ -436,6 +476,7 @@ impl GetPools for NerdAxeV1 {
             url: Some(main_pool_url),
             accepted_shares: accepted_share,
             rejected_shares: rejected_share,
+            last_share_time: None,
             active: Some(!is_using_fallback),
             alive: None,
             user: main_user,
@@ -458,6 +499,7 @@ impl GetPools for NerdAxeV1 {
             url: Some(fallback_pool_url),
             accepted_shares: None,
             rejected_shares: None,
+            last_share_time: None,
             active: Some(is_using_fallback),
             alive: None,
             user: fallback_user,
@@ -540,6 +582,9 @@ impl FactoryReset for NerdAxeV1 {
     }
 }
 
+impl RestartMining for NerdAxeV1 {}
+impl RestoreStockOs for NerdAxeV1 {}
+
 #[async_trait]
 impl SupportsScalingConfig for NerdAxeV1 {
     fn supports_scaling_config(&self) -> bool {
@@ -577,4 +622,7 @@ impl SupportsFanConfig for NerdAxeV1 {
 
 impl SupportsTemperatureConfig for NerdAxeV1 {}
 impl GetTuningPercent for NerdAxeV1 {}
+impl SetHashboardsEnabled for NerdAxeV1 {}
+
 impl SetTuningPercent for NerdAxeV1 {}
+impl SupportsPresets for NerdAxeV1 {}

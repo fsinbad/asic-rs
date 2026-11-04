@@ -3,6 +3,7 @@ use asic_rs_core::data::{board::MinerControlBoard, device::MinerHardware};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use strum::Display;
+use ts_rs::TS;
 
 use crate::models::AntMinerModel;
 
@@ -85,7 +86,19 @@ impl From<AntMinerModel> for MinerHardware {
                 fans: Some(4),
                 boards: Some(vec![Some(110), Some(110), Some(110)]),
             },
+            AntMinerModel::L11 => Self {
+                fans: Some(4),
+                boards: Some(vec![Some(88), Some(88), Some(88)]),
+            },
+            AntMinerModel::Z11j => Self {
+                fans: Some(2),
+                boards: Some(vec![Some(3), Some(3), Some(3)]),
+            },
             AntMinerModel::Z15 => Self {
+                fans: Some(2),
+                boards: Some(vec![Some(3), Some(3), Some(3)]),
+            },
+            AntMinerModel::Z15j => Self {
                 fans: Some(2),
                 boards: Some(vec![Some(3), Some(3), Some(3)]),
             },
@@ -205,6 +218,10 @@ impl From<AntMinerModel> for MinerHardware {
                 fans: Some(4),
                 boards: Some(vec![Some(55), Some(55), Some(55)]),
             },
+            AntMinerModel::S21PlusPlus => Self {
+                fans: Some(4),
+                boards: Some(vec![Some(55), Some(55), Some(55)]),
+            },
             AntMinerModel::S21PlusHydro => Self {
                 fans: Some(0),
                 boards: Some(vec![Some(95), Some(95), Some(95)]),
@@ -233,12 +250,24 @@ impl From<AntMinerModel> for MinerHardware {
                 fans: Some(0),
                 boards: Some(vec![Some(160), Some(160), Some(160)]),
             },
+            AntMinerModel::S21XPHydro => Self {
+                fans: Some(0),
+                boards: Some(vec![Some(160); 3]),
+            },
+            AntMinerModel::S21jXPHydro => Self {
+                fans: Some(0),
+                boards: Some(vec![Some(42); 3]),
+            },
+            AntMinerModel::S23Hydro => Self {
+                fans: Some(0),
+                boards: Some(vec![Some(84); 3]),
+            },
             AntMinerModel::Unknown(_) => Default::default(),
         }
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Hash, Serialize, Deserialize, Display)]
+#[derive(Debug, PartialEq, Eq, Clone, Hash, Serialize, Deserialize, Display, TS)]
 pub enum AntMinerControlBoard {
     #[serde(rename = "Xilinx")]
     Xilinx,

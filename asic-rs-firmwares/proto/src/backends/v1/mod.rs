@@ -23,6 +23,7 @@ use asic_rs_core::{
         hashrate::{HashRate, HashRateUnit},
         message::{MessageSeverity, MinerComponent, MinerMessage},
         miner::TuningTarget,
+        operating_state::OperatingState,
         pool::{PoolData, PoolGroupData, PoolURL},
     },
     traits::{
@@ -129,7 +130,10 @@ impl APIClient for ProtoV1 {
     async fn get_api_result(&self, command: &MinerCommand) -> anyhow::Result<Value> {
         match command {
             MinerCommand::WebAPI { .. } => self.web.get_api_result(command).await,
-            _ => Err(anyhow!("Unsupported command type for Proto API")),
+            _ => Err(anyhow!(
+                "Unsupported command type for {} API",
+                ProtoFirmware::default()
+            )),
         }
     }
 }
@@ -360,6 +364,14 @@ impl GetDataLocations for ProtoV1 {
                     tag: None,
                 },
             )],
+            DataField::OperatingState => vec![(
+                WEB_MINING,
+                DataExtractor {
+                    func: get_by_pointer,
+                    key: Some("/mining-status/status"),
+                    tag: None,
+                },
+            )],
             DataField::Pools => vec![(
                 WEB_POOLS,
                 DataExtractor {
@@ -520,18 +532,18 @@ impl GetHashboards for ProtoV1 {
                 HashRate {
                     value: ths,
                     unit: HashRateUnit::TeraHash,
-                    algo: "SHA256".to_string(),
+                    algo: self.device_info.algo,
                 }
-                .as_unit(HashRateUnit::default())
+                .as_default_unit()
             });
 
             board.expected_hashrate = ideal_hashrate
                 .map(|ghs| HashRate {
                     value: ghs / board_count,
                     unit: HashRateUnit::GigaHash,
-                    algo: "SHA256".to_string(),
+                    algo: self.device_info.algo,
                 })
-                .map(|hr| hr.as_unit(HashRateUnit::default()));
+                .map(|hr| hr.as_default_unit());
 
             board.board_temperature = telemetry
                 .pointer("/temperature/average")
@@ -568,9 +580,9 @@ impl GetHashrate for ProtoV1 {
             HashRate {
                 value: ths,
                 unit: HashRateUnit::TeraHash,
-                algo: "SHA256".to_string(),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default())
+            .as_default_unit()
         })
     }
 }
@@ -581,9 +593,9 @@ impl GetExpectedHashrate for ProtoV1 {
             HashRate {
                 value: ghs,
                 unit: HashRateUnit::GigaHash,
-                algo: "SHA256".to_string(),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default())
+            .as_default_unit()
         })
     }
 }
@@ -607,6 +619,8 @@ impl GetFans for ProtoV1 {
 }
 
 impl GetPsuFans for ProtoV1 {}
+impl GetPsus for ProtoV1 {}
+impl SupportsTimezoneConfig for ProtoV1 {}
 impl GetFluidTemperature for ProtoV1 {}
 
 impl GetWattage for ProtoV1 {
@@ -691,6 +705,22 @@ impl GetUptime for ProtoV1 {
     }
 }
 
+impl GetBestShare for ProtoV1 {}
+impl GetSessionBestShare for ProtoV1 {}
+
+impl GetOperatingState for ProtoV1 {
+    fn parse_operating_state(&self, data: &HashMap<DataField, Value>) -> Option<OperatingState> {
+        let label = data.get(&DataField::OperatingState)?.as_str()?;
+        match label {
+            "PoweringOn" => Some(OperatingState::Starting {}),
+            "PoweringOff" => Some(OperatingState::Stopping {}),
+            _ => OperatingState::from_label(label),
+        }
+    }
+}
+
+impl GetDevFeeConnected for ProtoV1 {}
+
 impl GetIsMining for ProtoV1 {
     fn parse_is_mining(&self, data: &HashMap<DataField, Value>) -> bool {
         matches!(
@@ -719,6 +749,7 @@ impl GetPools for ProtoV1 {
                     .map(|raw| PoolURL::from(raw.to_string())),
                 accepted_shares: pool.get("accepted").and_then(Value::as_u64),
                 rejected_shares: pool.get("rejected").and_then(Value::as_u64),
+                last_share_time: None,
                 active: pool
                     .get("status")
                     .and_then(Value::as_str)
@@ -837,6 +868,9 @@ impl FactoryReset for ProtoV1 {
     }
 }
 
+impl RestartMining for ProtoV1 {}
+impl RestoreStockOs for ProtoV1 {}
+
 #[async_trait]
 impl ReadLogs for ProtoV1 {
     async fn read_logs(&self) -> anyhow::Result<String> {
@@ -923,7 +957,8 @@ impl SupportsTuningConfig for ProtoV1 {
             return self.set_power_limit(power).await;
         }
         Err(anyhow!(
-            "Proto tuning currently supports power targets only"
+            "{} tuning currently supports power targets only",
+            ProtoFirmware::default()
         ))
     }
 
@@ -1012,7 +1047,11 @@ impl Validate for ProtoV1 {
 
 impl SupportsTemperatureConfig for ProtoV1 {}
 impl GetTuningPercent for ProtoV1 {}
+impl SetHashboardsEnabled for ProtoV1 {}
+
 impl SetTuningPercent for ProtoV1 {}
+
+impl SupportsPresets for ProtoV1 {}
 
 #[cfg(test)]
 mod tests {
@@ -1040,6 +1079,46 @@ mod tests {
 
     fn parse_fixture(raw: &str) -> Value {
         Value::from_str(raw).expect("fixture parses")
+    }
+
+    #[tokio::test]
+    async fn operating_state_preserves_degraded_mining_and_power_transitions() {
+        let miner = ProtoV1::new(
+            IpAddr::from([127, 0, 0, 1]),
+            asic_rs_makes_proto::models::ProtoModel::Rig,
+            None,
+            ProtoV1::hardware_from_response(&parse_fixture(HARDWARE)),
+        );
+        for (label, expected, is_mining) in [
+            ("Mining", OperatingState::Mining {}, true),
+            ("DegradedMining", OperatingState::DegradedMining {}, true),
+            ("PoweringOn", OperatingState::Starting {}, true),
+            ("PoweringOff", OperatingState::Stopping {}, false),
+            (
+                "NewProtoState",
+                OperatingState::Unknown {
+                    raw: "NewProtoState".into(),
+                },
+                false,
+            ),
+        ] {
+            let mut mining = parse_fixture(MINING);
+            mining["mining-status"]["status"] = json!(label);
+            let client = MockAPIClient::new(HashMap::from([(
+                MinerCommand::WebAPI {
+                    command: "/api/v1/mining",
+                    parameters: None,
+                },
+                mining,
+            )]));
+            let mut collector = DataCollector::new_with_client(&miner, &client);
+            let data = collector
+                .collect(&[DataField::OperatingState, DataField::IsMining])
+                .await;
+            let snapshot = miner.parse_data(data);
+            assert_eq!(snapshot.operating_state, Some(expected));
+            assert_eq!(snapshot.is_mining, is_mining);
+        }
     }
 
     fn command_results() -> HashMap<MinerCommand, Value> {
@@ -1225,7 +1304,7 @@ mod tests {
             HashRate {
                 value: 145.0,
                 unit: HashRateUnit::TeraHash,
-                algo: "SHA256".to_string(),
+                algo: HashAlgorithm::SHA256,
             }
         );
         assert!(

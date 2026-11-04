@@ -1,7 +1,7 @@
 use std::{fmt::Display, net::IpAddr};
 
 use asic_rs_core::{
-    data::command::MinerCommand,
+    data::command::{DiscoveryCommand, MinerCommand},
     discovery::{HTTP_WEB_ROOT, RPC_DEVDETAILS},
     errors::ModelSelectionError,
     traits::{
@@ -11,7 +11,6 @@ use asic_rs_core::{
         identification::{FirmwareIdentification, WebResponse},
         make::MinerMake,
         miner::{APIClient, HasDefaultAuth, Miner, MinerAuth, MinerConstructor},
-        model::MinerModel,
     },
     util,
 };
@@ -52,14 +51,16 @@ async fn send_v3_get_device_info(ip: &IpAddr) -> Option<serde_json::Value> {
 }
 
 impl DiscoveryCommands for WhatsMinerFirmware {
-    fn get_discovery_commands(&self) -> Vec<MinerCommand> {
+    fn get_discovery_commands(&self) -> Vec<DiscoveryCommand> {
         vec![RPC_DEVDETAILS, HTTP_WEB_ROOT]
     }
 }
 
 #[async_trait]
 impl MinerFirmware for WhatsMinerFirmware {
-    async fn get_model(ip: IpAddr) -> Result<impl MinerModel + Send, ModelSelectionError> {
+    type Model = asic_rs_makes_whatsminer::models::WhatsMinerModel;
+
+    async fn get_model(ip: IpAddr) -> Result<Self::Model, ModelSelectionError> {
         let use_v3 = if let Some(data) = util::send_rpc_command(&ip, "get_version").await {
             data["Msg"]["fw_ver"]
                 .as_str()

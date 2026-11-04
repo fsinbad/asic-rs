@@ -5,7 +5,11 @@ use asic_rs_core::{
     config::{
         collector::{ConfigCollector, ConfigExtractor, ConfigField, ConfigLocation},
         pools::PoolGroupConfig,
+        preset::PresetInfo,
+        scaling::ScalingConfig,
         temperature::TemperatureConfig,
+        timezone::TimezoneConfig,
+        tuning::TuningConfig,
     },
     data::{
         board::{BoardData, ChipData, MinerControlBoard},
@@ -13,10 +17,13 @@ use asic_rs_core::{
             DataCollector, DataExtensions, DataExtractor, DataField, DataLocation, get_by_pointer,
         },
         command::MinerCommand,
-        device::{DeviceInfo, HashAlgorithm},
+        device::DeviceInfo,
         fan::FanData,
+        firmware::RestoreStockOsResult,
         hashrate::{HashRate, HashRateUnit},
         message::{MessageSeverity, MinerMessage},
+        miner::TuningTarget,
+        operating_state::OperatingState,
         pool::{PoolData, PoolGroupData, PoolURL},
     },
     traits::{miner::*, model::MinerModel},
@@ -29,7 +36,10 @@ use semver::Version;
 use serde_json::{Value, json};
 use web::VnishWebAPI;
 
-use crate::firmware::VnishFirmware;
+use crate::{
+    firmware::VnishFirmware,
+    timezone::{tz_to_vnish_offset_now, vnish_offset_to_tz},
+};
 
 mod web;
 
@@ -43,10 +53,11 @@ pub struct VnishV130 {
 impl VnishV130 {
     pub fn new(ip: IpAddr, model: impl MinerModel) -> Self {
         let auth = Self::default_auth();
+        let algo = model.hash_algorithm();
         VnishV130 {
             ip,
             web: VnishWebAPI::new(ip, 80, auth),
-            device_info: DeviceInfo::new(model, VnishFirmware::default(), HashAlgorithm::SHA256),
+            device_info: DeviceInfo::new(model, VnishFirmware::default(), algo),
         }
     }
 }
@@ -56,7 +67,10 @@ impl APIClient for VnishV130 {
     async fn get_api_result(&self, command: &MinerCommand) -> anyhow::Result<Value> {
         match command {
             MinerCommand::WebAPI { .. } => self.web.get_api_result(command).await,
-            _ => Err(anyhow::anyhow!("Unsupported command type for Vnish API")),
+            _ => Err(anyhow::anyhow!(
+                "Unsupported command type for {} API",
+                VnishFirmware::default()
+            )),
         }
     }
 }
@@ -67,12 +81,24 @@ impl GetConfigsLocations for VnishV130 {
             command: "summary",
             parameters: None,
         };
+        const WEB_SETTINGS: MinerCommand = MinerCommand::WebAPI {
+            command: "settings",
+            parameters: None,
+        };
         match data_field {
             ConfigField::Temperature => vec![(
                 WEB_SUMMARY,
                 ConfigExtractor {
                     func: get_by_pointer,
                     key: Some("/miner"),
+                    tag: None,
+                },
+            )],
+            ConfigField::Timezone => vec![(
+                WEB_SETTINGS,
+                ConfigExtractor {
+                    func: get_by_pointer,
+                    key: Some("/regional/timezone"),
                     tag: None,
                 },
             )],
@@ -107,6 +133,10 @@ impl GetDataLocations for VnishV130 {
         };
         const WEB_FACTORY_INFO: MinerCommand = MinerCommand::WebAPI {
             command: "chains/factory-info",
+            parameters: None,
+        };
+        const WEB_SETTINGS: MinerCommand = MinerCommand::WebAPI {
+            command: "settings",
             parameters: None,
         };
 
@@ -177,21 +207,35 @@ impl GetDataLocations for VnishV130 {
                     tag: None,
                 },
             )],
-            DataField::Hashrate => vec![(
-                WEB_SUMMARY,
-                DataExtractor {
-                    func: get_by_pointer,
-                    key: Some("/miner/hr_realtime"),
-                    tag: None,
-                },
-            )],
+            // `/info`'s `hr_measure` rides along with every hashrate figure so
+            // the value can be scaled by the unit VNish actually reports —
+            // GH/s on SHA-256 models, MH/s on Scrypt ones — rather than a
+            // hardcoded assumption.
+            DataField::Hashrate => vec![
+                (
+                    WEB_SUMMARY,
+                    DataExtractor {
+                        func: get_by_pointer,
+                        key: Some("/miner/hr_realtime"),
+                        tag: Some("hashrate"),
+                    },
+                ),
+                (
+                    WEB_INFO,
+                    DataExtractor {
+                        func: get_by_pointer,
+                        key: Some("/hr_measure"),
+                        tag: Some("unit"),
+                    },
+                ),
+            ],
             DataField::ExpectedHashrate => vec![
                 (
                     WEB_FACTORY_INFO,
                     DataExtractor {
                         func: get_by_pointer,
                         key: Some("/hr_stock"),
-                        tag: None,
+                        tag: Some("hashrate"),
                     },
                 ),
                 (
@@ -199,7 +243,15 @@ impl GetDataLocations for VnishV130 {
                     DataExtractor {
                         func: get_by_pointer,
                         key: Some("/miner/hr_stock"),
-                        tag: None,
+                        tag: Some("hashrate"),
+                    },
+                ),
+                (
+                    WEB_INFO,
+                    DataExtractor {
+                        func: get_by_pointer,
+                        key: Some("/hr_measure"),
+                        tag: Some("unit"),
                     },
                 ),
             ],
@@ -225,7 +277,7 @@ impl GetDataLocations for VnishV130 {
                     DataExtractor {
                         func: get_by_pointer,
                         key: Some("/miner/chains"),
-                        tag: None,
+                        tag: Some("chains"),
                     },
                 ),
                 (
@@ -233,7 +285,15 @@ impl GetDataLocations for VnishV130 {
                     DataExtractor {
                         func: get_by_pointer,
                         key: Some(""),
-                        tag: None,
+                        tag: Some("chains"),
+                    },
+                ),
+                (
+                    WEB_INFO,
+                    DataExtractor {
+                        func: get_by_pointer,
+                        key: Some("/hr_measure"),
+                        tag: Some("unit"),
                     },
                 ),
             ],
@@ -253,7 +313,23 @@ impl GetDataLocations for VnishV130 {
                     tag: None,
                 },
             )],
+            DataField::DevFeeConnected => vec![(
+                WEB_SUMMARY,
+                DataExtractor {
+                    func: get_by_pointer,
+                    key: Some("/miner/pools"),
+                    tag: None,
+                },
+            )],
             DataField::IsMining => vec![(
+                WEB_STATUS,
+                DataExtractor {
+                    func: get_by_pointer,
+                    key: Some("/miner_state"),
+                    tag: None,
+                },
+            )],
+            DataField::OperatingState => vec![(
                 WEB_STATUS,
                 DataExtractor {
                     func: get_by_pointer,
@@ -298,6 +374,14 @@ impl GetDataLocations for VnishV130 {
                 DataExtractor {
                     func: get_by_pointer,
                     key: Some("/miner/miner_status/throttled"),
+                    tag: None,
+                },
+            )],
+            DataField::TuningTarget => vec![(
+                WEB_SETTINGS,
+                DataExtractor {
+                    func: get_by_pointer,
+                    key: Some("/miner/overclock/preset"),
                     tag: None,
                 },
             )],
@@ -367,9 +451,19 @@ impl GetControlBoardVersion for VnishV130 {
 
 impl GetHashboards for VnishV130 {
     fn parse_hashboards(&self, data: &HashMap<DataField, Value>) -> Vec<BoardData> {
-        let Some(all_chains) = data.get(&DataField::Hashboards).and_then(|v| v.as_array()) else {
+        let hashboards_data = data.get(&DataField::Hashboards);
+        let Some(all_chains) = hashboards_data
+            .and_then(|v| v.pointer("/chains"))
+            .and_then(|v| v.as_array())
+        else {
             return Vec::new();
         };
+        let unit = hashboards_data
+            .and_then(|v| v.pointer("/unit"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| HashRateUnit::from_str(s).ok())
+            .unwrap_or(HashRateUnit::GigaHash);
+        let algo = self.device_info.algo;
         let chip_chains = data.get(&DataField::Chips).and_then(|v| v.as_array());
 
         let mut hashboards: Vec<BoardData> =
@@ -406,10 +500,10 @@ impl GetHashboards for VnishV130 {
                 .map(|f| {
                     HashRate {
                         value: f,
-                        unit: HashRateUnit::GigaHash,
-                        algo: "SHA256".to_string(),
+                        unit,
+                        algo,
                     }
-                    .as_unit(HashRateUnit::default())
+                    .as_default_unit()
                 });
             board.expected_hashrate = ["/hashrate_ideal", "/hr_nominal"]
                 .iter()
@@ -417,10 +511,10 @@ impl GetHashboards for VnishV130 {
                 .map(|f| {
                     HashRate {
                         value: f,
-                        unit: HashRateUnit::GigaHash,
-                        algo: "SHA256".to_string(),
+                        unit,
+                        algo,
                     }
-                    .as_unit(HashRateUnit::default())
+                    .as_default_unit()
                 });
             board.board_temperature = chain
                 .pointer("/pcb_temp/max")
@@ -465,11 +559,11 @@ impl GetHashboards for VnishV130 {
                                         {
                                             HashRate {
                                                 value: f,
-                                                unit: HashRateUnit::GigaHash,
-                                                algo: "SHA256".to_string(),
+                                                unit,
+                                                algo,
                                             }
                                         }
-                                        .as_unit(HashRateUnit::default())
+                                        .as_default_unit()
                                     });
                                 let working = hashrate.as_ref().map(|hr| hr.value > 0.0);
                                 ChipData {
@@ -528,27 +622,43 @@ impl GetHashboards for VnishV130 {
 
 impl GetHashrate for VnishV130 {
     fn parse_hashrate(&self, data: &HashMap<DataField, Value>) -> Option<HashRate> {
-        data.extract_map::<f64, _>(DataField::Hashrate, |f| {
+        let field = data.get(&DataField::Hashrate);
+        let value = field?.pointer("/hashrate")?.as_f64()?;
+        Some(
             HashRate {
-                value: f,
-                unit: HashRateUnit::GigaHash,
-                algo: "SHA256".to_string(),
+                value,
+                // `/info`'s `hr_measure`: `"GH/s"`, `"MH/s"` or `"N/A"`. GH/s
+                // when it cannot say, which is what SHA-256 models report.
+                unit: field
+                    .and_then(|v| v.pointer("/unit"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| HashRateUnit::from_str(s).ok())
+                    .unwrap_or(HashRateUnit::GigaHash),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default())
-        })
+            .as_default_unit(),
+        )
     }
 }
 
 impl GetExpectedHashrate for VnishV130 {
     fn parse_expected_hashrate(&self, data: &HashMap<DataField, Value>) -> Option<HashRate> {
-        data.extract_map::<f64, _>(DataField::ExpectedHashrate, |f| {
+        let field = data.get(&DataField::ExpectedHashrate);
+        let value = field?.pointer("/hashrate")?.as_f64()?;
+        Some(
             HashRate {
-                value: f,
-                unit: HashRateUnit::GigaHash,
-                algo: "SHA256".to_string(),
+                value,
+                // `/info`'s `hr_measure`: `"GH/s"`, `"MH/s"` or `"N/A"`. GH/s
+                // when it cannot say, which is what SHA-256 models report.
+                unit: field
+                    .and_then(|v| v.pointer("/unit"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| HashRateUnit::from_str(s).ok())
+                    .unwrap_or(HashRateUnit::GigaHash),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default())
-        })
+            .as_default_unit(),
+        )
     }
 }
 
@@ -574,6 +684,7 @@ impl GetFans for VnishV130 {
 }
 
 impl GetPsuFans for VnishV130 {}
+impl GetPsus for VnishV130 {}
 
 impl GetFluidTemperature for VnishV130 {
     fn parse_fluid_temperature(&self, data: &HashMap<DataField, Value>) -> Option<Temperature> {
@@ -619,7 +730,18 @@ impl GetTuningPercent for VnishV130 {
     }
 }
 
-impl GetTuningTarget for VnishV130 {}
+impl GetTuningTarget for VnishV130 {
+    /// On VNish the active tuning target is the selected autotune preset
+    /// (`miner.overclock.preset` in `/settings`).
+    fn parse_tuning_target(&self, data: &HashMap<DataField, Value>) -> Option<TuningTarget> {
+        let preset = data.get(&DataField::TuningTarget)?;
+        preset
+            .as_str()
+            .map(String::from)
+            .or_else(|| preset.as_i64().map(|n| n.to_string()))
+            .map(TuningTarget::Preset)
+    }
+}
 
 impl GetScaledTuningTarget for VnishV130 {}
 impl GetTuningCapabilities for VnishV130 {}
@@ -711,6 +833,27 @@ impl GetUptime for VnishV130 {
     }
 }
 
+impl GetBestShare for VnishV130 {}
+impl GetSessionBestShare for VnishV130 {}
+
+impl GetOperatingState for VnishV130 {
+    fn parse_operating_state(&self, data: &HashMap<DataField, Value>) -> Option<OperatingState> {
+        let label = data.get(&DataField::OperatingState)?.as_str()?;
+        match label {
+            "auto-tuning" | "auto_tuning" => Some(OperatingState::Tuning {}),
+            "failure" | "failed" | "broken" => Some(OperatingState::Error {}),
+            "idle" => Some(OperatingState::Idling {}),
+            _ => OperatingState::from_label(label),
+        }
+    }
+}
+
+impl GetDevFeeConnected for VnishV130 {
+    fn parse_devfee_connected(&self, data: &HashMap<DataField, Value>) -> Option<bool> {
+        super::parse_devfee_connected(data.get(&DataField::DevFeeConnected)?)
+    }
+}
+
 impl GetIsMining for VnishV130 {
     fn parse_is_mining(&self, data: &HashMap<DataField, Value>) -> bool {
         data.extract::<String>(DataField::IsMining)
@@ -748,6 +891,9 @@ impl GetPools for VnishV130 {
                     url,
                     accepted_shares,
                     rejected_shares,
+                    last_share_time: pool
+                        .pointer("/ls_time")
+                        .and_then(asic_rs_core::util::parse_last_share_time),
                     active,
                     alive,
                     user,
@@ -859,6 +1005,8 @@ impl SetPowerLimit for VnishV130 {
     }
 }
 
+impl SetHashboardsEnabled for VnishV130 {}
+
 #[async_trait]
 impl SetTuningPercent for VnishV130 {
     fn supports_set_tuning_percent(&self) -> bool {
@@ -871,6 +1019,36 @@ impl SetTuningPercent for VnishV130 {
         let percent = percent.clamp(20, 100);
         self.web.throttle(percent).await?;
         Ok(true)
+    }
+}
+
+#[async_trait]
+impl SupportsPresets for VnishV130 {
+    fn supports_presets(&self) -> bool {
+        true
+    }
+
+    /// VNish exposes its autotune presets at `/autotune/presets`, each
+    /// `{ "name": "5560", "pretty": "5560 watt ~ 175 TH", "status": "tuned" }`.
+    async fn get_presets(&self) -> Vec<PresetInfo> {
+        let Ok(presets) = self.web.autotune_presets().await else {
+            return Vec::new();
+        };
+        let list = presets
+            .as_array()
+            .cloned()
+            .or_else(|| presets.get("presets").and_then(|p| p.as_array()).cloned())
+            .unwrap_or_default();
+        list.iter()
+            .filter_map(|p| {
+                let name = p.get("name")?.as_str()?.to_string();
+                Some(PresetInfo {
+                    name,
+                    pretty: p.get("pretty").and_then(|v| v.as_str()).map(String::from),
+                    status: p.get("status").and_then(|v| v.as_str()).map(String::from),
+                })
+            })
+            .collect()
     }
 }
 
@@ -901,11 +1079,10 @@ impl SupportsPoolsConfig for VnishV130 {
             })
             .collect();
 
-        Ok(self
-            .web
+        self.web
             .set_settings(json!({ "miner": { "pools": pools } }))
-            .await
-            .is_ok())
+            .await?;
+        Ok(true)
     }
 
     fn supports_pools_config(&self) -> bool {
@@ -916,7 +1093,8 @@ impl SupportsPoolsConfig for VnishV130 {
 #[async_trait]
 impl Restart for VnishV130 {
     async fn restart(&self) -> anyhow::Result<bool> {
-        Ok(self.web.restart().await.is_ok())
+        self.web.restart().await?;
+        Ok(true)
     }
 
     fn supports_restart(&self) -> bool {
@@ -928,7 +1106,8 @@ impl Restart for VnishV130 {
 impl Pause for VnishV130 {
     #[allow(unused_variables)]
     async fn pause(&self, at_time: Option<Duration>) -> anyhow::Result<bool> {
-        Ok(self.web.stop().await.is_ok())
+        self.web.stop().await?;
+        Ok(true)
     }
 
     fn supports_pause(&self) -> bool {
@@ -940,7 +1119,8 @@ impl Pause for VnishV130 {
 impl Resume for VnishV130 {
     #[allow(unused_variables)]
     async fn resume(&self, at_time: Option<Duration>) -> anyhow::Result<bool> {
-        Ok(self.web.start().await.is_ok())
+        self.web.start().await?;
+        Ok(true)
     }
 
     fn supports_resume(&self) -> bool {
@@ -987,6 +1167,30 @@ impl FactoryReset for VnishV130 {
 }
 
 #[async_trait]
+impl RestartMining for VnishV130 {
+    async fn restart_mining(&self) -> anyhow::Result<bool> {
+        self.web.restart_mining().await?;
+        Ok(true)
+    }
+
+    fn supports_restart_mining(&self) -> bool {
+        true
+    }
+}
+
+#[async_trait]
+impl RestoreStockOs for VnishV130 {
+    async fn restore_stock_os(&self) -> anyhow::Result<RestoreStockOsResult> {
+        let reboot_after_seconds = self.web.restore_stock_os().await?;
+        Ok(RestoreStockOsResult::accepted(Some(reboot_after_seconds)))
+    }
+
+    fn supports_restore_stock_os(&self) -> bool {
+        true
+    }
+}
+
+#[async_trait]
 impl SupportsScalingConfig for VnishV130 {
     fn supports_scaling_config(&self) -> bool {
         false
@@ -1021,6 +1225,65 @@ impl SupportsTemperatureConfig for VnishV130 {
 }
 
 #[async_trait]
+impl SupportsTimezoneConfig for VnishV130 {
+    fn supports_timezone_config(&self) -> bool {
+        true
+    }
+
+    /// VNish 1.3.x stores a fixed UTC offset (e.g. `"GMT+2"`) under
+    /// `/regional/timezone` in `/settings` — same shape as 1.2.x. No DST, no list
+    /// endpoint, so fall back to the whole-hour offsets. Both are reported as the
+    /// equivalent IANA `Etc/GMT*` zones.
+    fn parse_timezone_config(
+        &self,
+        data: &HashMap<ConfigField, Value>,
+    ) -> anyhow::Result<TimezoneConfig> {
+        const DEFAULT_OFFSETS: &[&str] = &[
+            "GMT-12", "GMT-11", "GMT-10", "GMT-9", "GMT-8", "GMT-7", "GMT-6", "GMT-5", "GMT-4",
+            "GMT-3", "GMT-2", "GMT-1", "GMT+0", "GMT+1", "GMT+2", "GMT+3", "GMT+4", "GMT+5",
+            "GMT+6", "GMT+7", "GMT+8", "GMT+9", "GMT+10", "GMT+11", "GMT+12", "GMT+13", "GMT+14",
+        ];
+        let obj = data
+            .get(&ConfigField::Timezone)
+            .ok_or_else(|| anyhow::anyhow!("No timezone data returned"))?;
+        // `"GMT+2"` (UTC+2) becomes the canonical `Etc/GMT-2`: the sign flips.
+        let timezone = obj
+            .pointer("/current")
+            .and_then(|v| v.as_str())
+            .map(vnish_offset_to_tz)
+            .transpose()?;
+        let available = DEFAULT_OFFSETS
+            .iter()
+            .map(|offset| vnish_offset_to_tz(offset))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(TimezoneConfig {
+            timezone,
+            available,
+        })
+    }
+
+    async fn set_timezone_config(&self, config: TimezoneConfig) -> anyhow::Result<bool> {
+        let timezone = config
+            .timezone
+            .ok_or_else(|| anyhow::anyhow!("Timezone config has no timezone to set"))?;
+        // Only the fixed-offset `Etc/GMT*` zones survive the trip; a DST zone is
+        // rejected with a hint at its current equivalent (see `tz_to_vnish_offset`).
+        let timezone = tz_to_vnish_offset_now(timezone)?;
+        let mut settings = self.web.settings().await?;
+        match settings.pointer_mut("/regional/timezone") {
+            Some(tz) => {
+                tz["current"] = json!(timezone);
+            }
+            None => anyhow::bail!(
+                "{} settings has no /regional/timezone",
+                VnishFirmware::default()
+            ),
+        }
+        self.web.set_settings(settings).await.map(|_| true)
+    }
+}
+
+#[async_trait]
 impl UpgradeFirmware for VnishV130 {
     fn supports_upgrade_firmware(&self) -> bool {
         false
@@ -1050,7 +1313,61 @@ impl Validate for VnishV130 {
 #[async_trait]
 impl SupportsTuningConfig for VnishV130 {
     fn supports_tuning_config(&self) -> bool {
-        false
+        true
+    }
+
+    /// VNish tunes by selecting a named autotune preset. A `Preset` target sets
+    /// `miner.overclock.preset` directly; a `Power` target reuses the
+    /// preset-picking logic in `set_power_limit`.
+    async fn set_tuning_config(
+        &self,
+        config: TuningConfig,
+        _scaling_config: Option<ScalingConfig>,
+    ) -> anyhow::Result<bool> {
+        match config.target {
+            TuningTarget::Manual { .. } => {
+                anyhow::bail!(
+                    "Manual tuning target is not supported on {}",
+                    VnishFirmware::default()
+                )
+            }
+            TuningTarget::Preset(name) => {
+                let mut settings = self.web.settings().await?;
+                {
+                    let overclock = settings
+                        .pointer_mut("/miner/overclock")
+                        .ok_or_else(|| anyhow::anyhow!("settings missing miner.overclock"))?;
+                    overclock["preset"] = json!(name);
+                }
+                let overclock = settings
+                    .pointer("/miner/overclock")
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("settings missing miner.overclock"))?;
+                self.web
+                    .set_settings(json!({ "miner": { "overclock": overclock } }))
+                    .await?;
+                let updated = self.web.settings().await?;
+                let applied = updated.pointer("/miner/overclock/preset").and_then(|p| {
+                    p.as_str()
+                        .map(String::from)
+                        .or_else(|| p.as_i64().map(|n| n.to_string()))
+                });
+                Ok(applied.as_deref() == Some(name.as_str()))
+            }
+            TuningTarget::Power(limit) => self.set_power_limit(limit).await,
+            TuningTarget::HashRate(_) => {
+                anyhow::bail!(
+                    "HashRate tuning target is not supported on {}",
+                    VnishFirmware::default()
+                )
+            }
+            TuningTarget::MiningMode(_) => {
+                anyhow::bail!(
+                    "MiningMode tuning target is not supported on {}",
+                    VnishFirmware::default()
+                )
+            }
+        }
     }
 }
 
@@ -1058,5 +1375,323 @@ impl SupportsTuningConfig for VnishV130 {
 impl SupportsFanConfig for VnishV130 {
     fn supports_fan_config(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use asic_rs_core::data::device::HashAlgorithm;
+    use asic_rs_core::test::api::MockAPIClient;
+    use asic_rs_makes_antminer::models::AntMinerModel;
+
+    use super::*;
+    use crate::backends::test::{MockHttpServer, mock_http_server};
+
+    fn miner_with_mock_web(port: u16) -> VnishV130 {
+        let ip = IpAddr::from([127, 0, 0, 1]);
+        let mut miner = VnishV130::new(ip, AntMinerModel::S19);
+        miner.web = VnishWebAPI::new(ip, port, MinerAuth::from_token("test-token"));
+        miner
+    }
+
+    #[tokio::test]
+    async fn restore_stock_os_sends_log_choice_and_parses_delay() -> anyhow::Result<()> {
+        let MockHttpServer { port, task } = mock_http_server(200, "OK", r#"{"after":7}"#).await?;
+        let miner = miner_with_mock_web(port);
+
+        assert!(miner.supports_factory_reset());
+        assert!(miner.supports_restore_stock_os());
+        assert_eq!(
+            miner.restore_stock_os().await?,
+            RestoreStockOsResult::accepted(Some(7))
+        );
+
+        let request = task.await??;
+        let (headers, body) = request
+            .split_once("\r\n\r\n")
+            .expect("complete HTTP request");
+        assert!(headers.starts_with("POST /api/v1/firmware/remove HTTP/1.1\r\n"));
+        assert!(
+            headers
+                .lines()
+                .any(|line| { line.eq_ignore_ascii_case("authorization: Bearer test-token") })
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(body)?,
+            json!({ "remove_stock_logs": false })
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_mining_accepts_bodyless_mining_restart_response() -> anyhow::Result<()> {
+        let MockHttpServer { port, task } = mock_http_server(200, "OK", "").await?;
+        let miner = miner_with_mock_web(port);
+
+        assert!(miner.supports_restart_mining());
+        assert!(miner.restart_mining().await?);
+
+        let request = task.await??;
+        assert!(request.starts_with("POST /api/v1/mining/restart HTTP/1.1\r\n"));
+        assert!(
+            request
+                .lines()
+                .any(|line| { line.eq_ignore_ascii_case("authorization: Bearer test-token") })
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_mining_surfaces_firmware_rejection() -> anyhow::Result<()> {
+        for (status, reason, body) in [
+            (500, "Internal Server Error", r#"{"err":"miner is busy"}"#),
+            (200, "OK", r#"{"success":false,"err":"miner is busy"}"#),
+        ] {
+            let MockHttpServer { port, task } = mock_http_server(status, reason, body).await?;
+            let miner = miner_with_mock_web(port);
+
+            let error = miner.restart_mining().await.unwrap_err();
+
+            task.await??;
+            assert!(error.to_string().contains("miner is busy"));
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restore_stock_os_surfaces_incompatible_model() -> anyhow::Result<()> {
+        let MockHttpServer { port, task } =
+            mock_http_server(400, "Bad Request", r#"{"error":"unsupported model"}"#).await?;
+        let miner = miner_with_mock_web(port);
+
+        let error = miner.restore_stock_os().await.unwrap_err();
+
+        let request = task.await??;
+        assert!(request.starts_with("POST /api/v1/firmware/remove HTTP/1.1\r\n"));
+        assert!(error.to_string().contains("HTTP error: 400"));
+
+        Ok(())
+    }
+
+    fn web(command: &'static str) -> MinerCommand {
+        MinerCommand::WebAPI {
+            command,
+            parameters: None,
+        }
+    }
+
+    #[track_caller]
+    fn assert_unit(hashrate: HashRate, unit: HashRateUnit, expected: f64) {
+        let value = hashrate.as_unit(unit).value;
+        assert!(
+            (value - expected).abs() < 1e-6,
+            "expected {expected} {unit}, got {value}"
+        );
+    }
+
+    /// An L9 is a Scrypt miner and VNish says so in `/info`, both in
+    /// `algorithm` and by reporting `hr_measure: MH/s`. Before this was wired
+    /// up it came back as a SHA-256 miner and every figure was read as GH/s,
+    /// putting the hashrate out by a factor of 1000.
+    #[tokio::test]
+    async fn scrypt_model_is_read_in_the_unit_it_reports() {
+        let miner = VnishV130::new(IpAddr::from([127, 0, 0, 1]), AntMinerModel::L9);
+
+        let mut results = HashMap::new();
+        results.insert(
+            web("info"),
+            json!({
+                "miner": "Antminer L9",
+                "model": "L9",
+                "algorithm": "scrypt",
+                "hr_measure": "MH/s",
+                "fw_version": "1.3.4"
+            }),
+        );
+        results.insert(
+            web("summary"),
+            json!({
+                "miner": {
+                    "hr_realtime": 16200.0,
+                    "hr_stock": 16000.0,
+                    "chains": [
+                        { "id": 1, "hashrate_rt": 5400.0 },
+                        { "id": 2, "hashrate_rt": 5400.0 },
+                        { "id": 3, "hashrate_rt": 5400.0 }
+                    ]
+                }
+            }),
+        );
+
+        let mock_api = MockAPIClient::new(results);
+        let mut collector = DataCollector::new_with_client(&miner, &mock_api);
+        let miner_data = miner.parse_data(collector.collect_all().await);
+
+        let hashrate = miner_data.hashrate.expect("hashrate");
+        assert_eq!(hashrate.algo, HashAlgorithm::Scrypt);
+        assert_unit(hashrate, HashRateUnit::MegaHash, 16200.0);
+
+        let expected = miner_data.expected_hashrate.expect("expected hashrate");
+        assert_eq!(expected.algo, HashAlgorithm::Scrypt);
+        assert_unit(expected, HashRateUnit::MegaHash, 16000.0);
+
+        let board = miner_data.hashboards[0].hashrate.clone().expect("board 0");
+        assert_eq!(board.algo, HashAlgorithm::Scrypt);
+        assert_unit(board, HashRateUnit::MegaHash, 5400.0);
+    }
+
+    /// The SHA-256 path is unchanged: GH/s in, TH/s out, labelled SHA256.
+    #[tokio::test]
+    async fn sha256_model_is_unchanged() {
+        let miner = VnishV130::new(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S21);
+
+        let mut results = HashMap::new();
+        results.insert(
+            web("info"),
+            json!({
+                "miner": "Antminer S21",
+                "model": "S21",
+                "algorithm": "sha256d",
+                "hr_measure": "GH/s",
+                "fw_version": "1.3.4"
+            }),
+        );
+        results.insert(
+            web("summary"),
+            json!({ "miner": { "hr_realtime": 110000.0, "hr_stock": 110000.0 } }),
+        );
+
+        let mock_api = MockAPIClient::new(results);
+        let mut collector = DataCollector::new_with_client(&miner, &mock_api);
+        let miner_data = miner.parse_data(collector.collect_all().await);
+
+        let hashrate = miner_data.hashrate.expect("hashrate");
+        assert_eq!(hashrate.algo, HashAlgorithm::SHA256);
+        assert_eq!(hashrate.unit, HashRateUnit::TeraHash);
+        assert_unit(hashrate, HashRateUnit::TeraHash, 110.0);
+    }
+
+    /// VNish reports `N/A` on models where it cannot say. Falling back to GH/s
+    /// keeps those on exactly the path they took before.
+    #[tokio::test]
+    async fn unusable_unit_falls_back_to_gigahash() {
+        let miner = VnishV130::new(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S21);
+
+        let mut results = HashMap::new();
+        results.insert(
+            web("info"),
+            json!({ "miner": "Antminer S21", "hr_measure": "N/A", "fw_version": "1.3.4" }),
+        );
+        results.insert(
+            web("summary"),
+            json!({ "miner": { "hr_realtime": 110000.0 } }),
+        );
+
+        let mock_api = MockAPIClient::new(results);
+        let mut collector = DataCollector::new_with_client(&miner, &mock_api);
+        let miner_data = miner.parse_data(collector.collect_all().await);
+
+        assert_unit(
+            miner_data.hashrate.expect("hashrate"),
+            HashRateUnit::TeraHash,
+            110.0,
+        );
+    }
+
+    /// VNish's `"GMT+2"` is UTC+2, which is `Etc/GMT-2` in the POSIX-signed
+    /// IANA names the config reports; the offered list flips the same way.
+    #[test]
+    fn timezone_is_reported_as_the_sign_inverted_etc_gmt_zone() {
+        use asic_rs_core::config::timezone::Tz;
+
+        let miner = VnishV130::new(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S19);
+
+        let mut data = HashMap::new();
+        data.insert(ConfigField::Timezone, json!({ "current": "GMT+2" }));
+        let config = miner.parse_timezone_config(&data).expect("timezone config");
+
+        assert_eq!(config.timezone, Some(Tz::Etc__GMTMinus2));
+        assert_eq!(config.available.len(), 27);
+        assert_eq!(config.available.first(), Some(&Tz::Etc__GMTPlus12));
+        assert!(config.available.contains(&Tz::Etc__GMT));
+        assert_eq!(config.available.last(), Some(&Tz::Etc__GMTMinus14));
+    }
+
+    #[tokio::test]
+    async fn control_calls_report_why_the_miner_refused() -> anyhow::Result<()> {
+        let refusal = r#"{"err":"miner is not running"}"#;
+
+        let MockHttpServer { port, task } = mock_http_server(400, "Bad Request", refusal).await?;
+        let error = miner_with_mock_web(port).pause(None).await.unwrap_err();
+        assert!(
+            task.await??
+                .starts_with("POST /api/v1/mining/stop HTTP/1.1\r\n")
+        );
+        assert!(error.to_string().contains("400"), "{error}");
+        assert!(error.to_string().contains(refusal), "{error}");
+
+        let MockHttpServer { port, task } = mock_http_server(400, "Bad Request", refusal).await?;
+        let error = miner_with_mock_web(port).resume(None).await.unwrap_err();
+        assert!(
+            task.await??
+                .starts_with("POST /api/v1/mining/start HTTP/1.1\r\n")
+        );
+        assert!(error.to_string().contains("400"), "{error}");
+        assert!(error.to_string().contains(refusal), "{error}");
+
+        let MockHttpServer { port, task } = mock_http_server(400, "Bad Request", refusal).await?;
+        let error = miner_with_mock_web(port).restart().await.unwrap_err();
+        assert!(
+            task.await??
+                .starts_with("POST /api/v1/mining/restart HTTP/1.1\r\n")
+        );
+        assert!(error.to_string().contains("400"), "{error}");
+        assert!(error.to_string().contains(refusal), "{error}");
+
+        let MockHttpServer { port, task } = mock_http_server(400, "Bad Request", refusal).await?;
+        let error = miner_with_mock_web(port)
+            .set_pools_config(vec![])
+            .await
+            .unwrap_err();
+        assert!(
+            task.await??
+                .starts_with("POST /api/v1/settings HTTP/1.1\r\n")
+        );
+        assert!(error.to_string().contains("400"), "{error}");
+        assert!(error.to_string().contains(refusal), "{error}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepted_control_calls_still_return_true() -> anyhow::Result<()> {
+        let MockHttpServer { port, task } =
+            mock_http_server(200, "OK", r#"{"success":true}"#).await?;
+        assert!(miner_with_mock_web(port).pause(None).await?);
+        task.await??;
+
+        let MockHttpServer { port, task } =
+            mock_http_server(200, "OK", r#"{"success":true}"#).await?;
+        assert!(miner_with_mock_web(port).resume(None).await?);
+        task.await??;
+
+        let MockHttpServer { port, task } =
+            mock_http_server(200, "OK", r#"{"success":true}"#).await?;
+        assert!(miner_with_mock_web(port).restart().await?);
+        task.await??;
+
+        Ok(())
+    }
+
+    #[test]
+    fn http_error_without_a_body_reads_as_before() {
+        let error = web::VnishError::HttpError {
+            status: 500,
+            body: " ".to_string(),
+        };
+        assert_eq!(error.to_string(), "HTTP error: 500");
     }
 }

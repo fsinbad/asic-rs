@@ -70,23 +70,15 @@ fn is_zero_mac(mac: &MacAddr) -> bool {
     }
 }
 
-fn hash_rate_from_ghs(value: Option<f64>) -> Option<HashRate> {
-    value.map(|f| {
-        HashRate {
-            value: f,
-            unit: HashRateUnit::GigaHash,
-            algo: "SHA256".to_string(),
-        }
-        .as_unit(HashRateUnit::default())
-    })
-}
-
 #[async_trait]
 impl APIClient for ApolloV2 {
     async fn get_api_result(&self, command: &MinerCommand) -> anyhow::Result<Value> {
         match command {
             MinerCommand::GraphQL { .. } => self.graphql.get_api_result(command).await,
-            _ => Err(anyhow::anyhow!("Unsupported command type for Apollo API")),
+            _ => Err(anyhow::anyhow!(
+                "Unsupported command type for {} API",
+                ApolloFirmware::default()
+            )),
         }
     }
 }
@@ -359,7 +351,15 @@ impl GetDataLocations for ApolloV2 {
                     tag: None,
                 },
             )],
-            DataField::Hashboards | DataField::Chips => vec![(
+            DataField::Hashboards => vec![(
+                GQL_BOARD,
+                DataExtractor {
+                    func: get_by_pointer,
+                    key: Some("/Miner/stats/result/stats/0"),
+                    tag: None,
+                },
+            )],
+            DataField::Chips => vec![(
                 GQL_BOARD,
                 DataExtractor {
                     func: get_by_pointer,
@@ -524,15 +524,30 @@ impl GetHashboards for ApolloV2 {
         let active = ghs
             .map(|value| value > 0.0)
             .or_else(|| as_u64(slot.get("pwrOn")).map(|u| u > 0));
-        let hashrate = hash_rate_from_ghs(
-            ghs.or_else(|| as_f64(stats.pointer("/master/intervals/int_30/bySol"))),
-        );
+        let hashrate = ghs
+            .or_else(|| as_f64(stats.pointer("/master/intervals/int_30/bySol")))
+            .map(|f| {
+                HashRate {
+                    value: f,
+                    unit: HashRateUnit::GigaHash,
+                    algo: self.device_info.algo,
+                }
+                .as_default_unit()
+            });
 
         let mut board = BoardData::with_state(0, chips, None, active);
         board.working_chips = chips;
         board.hashrate = hashrate;
         board.expected_hashrate =
-            hash_rate_from_ghs(as_f64(stats.pointer("/master/intervals/int_30/byDiff")));
+            as_f64(stats.pointer("/master/intervals/int_30/byDiff")).map(|f| {
+                HashRate {
+                    value: f,
+                    unit: HashRateUnit::GigaHash,
+                    algo: self.device_info.algo,
+                }
+                .as_default_unit()
+            });
+
         board.board_temperature = as_f64(slot.get("temperature")).map(Temperature::from_celsius);
         board.inlet_chip_temperature = board.board_temperature;
         board.outlet_chip_temperature =
@@ -548,13 +563,27 @@ impl GetHashboards for ApolloV2 {
 
 impl GetHashrate for ApolloV2 {
     fn parse_hashrate(&self, data: &HashMap<DataField, Value>) -> Option<HashRate> {
-        hash_rate_from_ghs(as_f64(data.get(&DataField::Hashrate)))
+        as_f64(data.get(&DataField::Hashrate)).map(|f| {
+            HashRate {
+                value: f,
+                unit: HashRateUnit::GigaHash,
+                algo: self.device_info.algo,
+            }
+            .as_default_unit()
+        })
     }
 }
 
 impl GetExpectedHashrate for ApolloV2 {
     fn parse_expected_hashrate(&self, data: &HashMap<DataField, Value>) -> Option<HashRate> {
-        hash_rate_from_ghs(as_f64(data.get(&DataField::ExpectedHashrate)))
+        as_f64(data.get(&DataField::ExpectedHashrate)).map(|f| {
+            HashRate {
+                value: f,
+                unit: HashRateUnit::GigaHash,
+                algo: self.device_info.algo,
+            }
+            .as_default_unit()
+        })
     }
 }
 
@@ -588,6 +617,8 @@ impl GetFans for ApolloV2 {
 }
 
 impl GetPsuFans for ApolloV2 {}
+impl GetPsus for ApolloV2 {}
+impl SupportsTimezoneConfig for ApolloV2 {}
 
 impl GetFluidTemperature for ApolloV2 {}
 
@@ -610,6 +641,13 @@ impl GetUptime for ApolloV2 {
         as_u64(data.get(&DataField::Uptime)).map(Duration::from_secs)
     }
 }
+
+impl GetBestShare for ApolloV2 {}
+impl GetSessionBestShare for ApolloV2 {}
+
+impl GetOperatingState for ApolloV2 {}
+
+impl GetDevFeeConnected for ApolloV2 {}
 
 impl GetIsMining for ApolloV2 {
     fn parse_is_mining(&self, data: &HashMap<DataField, Value>) -> bool {
@@ -650,6 +688,7 @@ impl GetPools for ApolloV2 {
                 url: Some(PoolURL::from(format!("{host}:{port}"))),
                 accepted_shares: accepted,
                 rejected_shares: rejected,
+                last_share_time: None,
                 active,
                 alive: active,
                 user: pool
@@ -702,7 +741,7 @@ impl Restart for ApolloV2 {
             .pointer("/Miner/restart/error/message")
             .and_then(|v| v.as_str())
         {
-            anyhow::bail!("Apollo restart failed: {message}");
+            anyhow::bail!("{} restart failed: {message}", ApolloFirmware::default());
         }
         Ok(true)
     }
@@ -723,7 +762,7 @@ impl Pause for ApolloV2 {
             .pointer("/Miner/stop/error/message")
             .and_then(|v| v.as_str())
         {
-            anyhow::bail!("Apollo stop failed: {message}");
+            anyhow::bail!("{} stop failed: {message}", ApolloFirmware::default());
         }
         Ok(true)
     }
@@ -744,7 +783,7 @@ impl Resume for ApolloV2 {
             .pointer("/Miner/start/error/message")
             .and_then(|v| v.as_str())
         {
-            anyhow::bail!("Apollo start failed: {message}");
+            anyhow::bail!("{} start failed: {message}", ApolloFirmware::default());
         }
         Ok(true)
     }
@@ -771,6 +810,9 @@ impl FactoryReset for ApolloV2 {
         false
     }
 }
+
+impl RestartMining for ApolloV2 {}
+impl RestoreStockOs for ApolloV2 {}
 
 #[async_trait]
 impl SupportsScalingConfig for ApolloV2 {
@@ -810,7 +852,11 @@ impl Validate for ApolloV2 {
 
 impl SupportsTemperatureConfig for ApolloV2 {}
 impl GetTuningPercent for ApolloV2 {}
+impl SetHashboardsEnabled for ApolloV2 {}
+
 impl SetTuningPercent for ApolloV2 {}
+
+impl SupportsPresets for ApolloV2 {}
 
 #[cfg(test)]
 mod tests {

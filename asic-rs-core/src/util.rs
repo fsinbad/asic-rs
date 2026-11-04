@@ -5,7 +5,7 @@ use std::{
 };
 
 use reqwest::{StatusCode, header::HeaderMap};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpStream, ToSocketAddrs},
@@ -26,8 +26,70 @@ pub fn unix_timestamp_secs() -> u64 {
     )
 }
 
+/// Normalize a firmware-provided last-share value to a Unix timestamp in seconds.
+///
+/// Firmwares commonly expose either an epoch timestamp or a `HH:MM:SS` age. Values
+/// that cannot be identified unambiguously are ignored.
+pub fn parse_last_share_time(value: &Value) -> Option<u64> {
+    parse_last_share_time_at(value, unix_timestamp_secs())
+}
+
+fn parse_last_share_time_at(value: &Value, now: u64) -> Option<u64> {
+    const MIN_PLAUSIBLE_UNIX_TIMESTAMP: u64 = 946_684_800; // 2000-01-01
+
+    let absolute = value.as_u64().or_else(|| {
+        value
+            .as_str()
+            .map(str::trim)
+            .and_then(|value| value.parse::<u64>().ok())
+    });
+    if let Some(timestamp) = absolute {
+        return (timestamp >= MIN_PLAUSIBLE_UNIX_TIMESTAMP).then_some(timestamp);
+    }
+
+    let value = value.as_str()?.trim();
+    let parts = value
+        .split(':')
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let seconds_ago = match parts.as_slice() {
+        [hours, minutes, seconds] if *minutes < 60 && *seconds < 60 => hours
+            .checked_mul(60)?
+            .checked_add(*minutes)?
+            .checked_mul(60)?
+            .checked_add(*seconds)?,
+        [days, hours, minutes, seconds] if *hours < 24 && *minutes < 60 && *seconds < 60 => days
+            .checked_mul(24)?
+            .checked_add(*hours)?
+            .checked_mul(60)?
+            .checked_add(*minutes)?
+            .checked_mul(60)?
+            .checked_add(*seconds)?,
+        _ => return None,
+    };
+
+    now.checked_sub(seconds_ago)
+}
+
+/// Build an HTTP client with bounded connection and total-request deadlines
+/// for firmware discovery.
 pub fn build_discovery_client() -> Result<reqwest::Client, ModelSelectionError> {
+    build_discovery_client_with_timeout(DEFAULT_RPC_TIMEOUT)
+}
+
+fn build_discovery_client_with_timeout(
+    timeout: Duration,
+) -> Result<reqwest::Client, ModelSelectionError> {
     reqwest::Client::builder()
+        .connect_timeout(timeout)
+        .timeout(timeout)
+        // These requests do not reuse connections. Let the peer initiate close
+        // after its response to reduce local TIME_WAIT pressure during scans.
+        .default_headers(HeaderMap::from_iter([(
+            reqwest::header::CONNECTION,
+            reqwest::header::HeaderValue::from_static("close"),
+        )]))
         .pool_max_idle_per_host(0)
         .build()
         .map_err(|_| ModelSelectionError::NoModelResponse)
@@ -47,7 +109,12 @@ static HTTP_CLIENT: LazyLock<Result<reqwest::Client, reqwest::Error>> = LazyLock
         .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(true)
         .gzip(true)
+        .connect_timeout(DEFAULT_RPC_TIMEOUT)
         .timeout(DEFAULT_RPC_TIMEOUT)
+        .default_headers(HeaderMap::from_iter([(
+            reqwest::header::CONNECTION,
+            reqwest::header::HeaderValue::from_static("close"),
+        )]))
         .pool_max_idle_per_host(0)
         .build()
 });
@@ -136,10 +203,19 @@ pub async fn write_all_with_timeout(
 
 #[tracing::instrument(level = "debug")]
 pub async fn send_rpc_command(ip: &IpAddr, command: &'static str) -> Option<serde_json::Value> {
+    send_rpc_command_on_port(ip, command, 4028).await
+}
+
+#[tracing::instrument(level = "debug", fields(port))]
+pub async fn send_rpc_command_on_port(
+    ip: &IpAddr,
+    command: &'static str,
+    port: u16,
+) -> Option<serde_json::Value> {
     let response = {
-        let mut stream = connect_tcp_stream((*ip, 4028), DEFAULT_RPC_TIMEOUT)
+        let mut stream = connect_tcp_stream((*ip, port), DEFAULT_RPC_TIMEOUT)
             .await
-            .map_err(|_| tracing::debug!("failed to connect to {ip} rpc"))
+            .map_err(|error| tracing::debug!(%error, "failed to connect to {ip}:{port} rpc"))
             .ok()?;
 
         let command = format!("{{\"command\":\"{command}\"}}");
@@ -169,11 +245,20 @@ pub async fn send_web_command(
     ip: &IpAddr,
     command: &'static str,
 ) -> Option<(String, HeaderMap, StatusCode)> {
+    send_web_command_on_port(ip, command, 80).await
+}
+
+#[tracing::instrument(level = "debug", fields(port))]
+pub async fn send_web_command_on_port(
+    ip: &IpAddr,
+    command: &'static str,
+    port: u16,
+) -> Option<(String, HeaderMap, StatusCode)> {
     let data = http_client()?
-        .get(format!("http://{ip}{command}"))
+        .get(format!("http://{ip}:{port}{command}"))
         .send()
         .await
-        .map_err(|_| tracing::debug!("failed to connect to {ip} web"))
+        .map_err(|_| tracing::debug!("failed to connect to {ip}:{port} web"))
         .ok()?;
 
     let headers = data.headers().clone();
@@ -242,7 +327,27 @@ fn parse_rpc_result(response: &str) -> Option<serde_json::Value> {
 mod tests {
     use super::*;
     use crate::errors::RPCError;
-    use tokio::io::AsyncWriteExt;
+    use tokio::{io::AsyncWriteExt, net::TcpListener};
+
+    #[tokio::test]
+    async fn discovery_http_client_times_out_on_stalled_response() -> anyhow::Result<()> {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await?;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            std::io::Result::Ok(())
+        });
+        let client = build_discovery_client_with_timeout(Duration::from_millis(50))?;
+        let started = tokio::time::Instant::now();
+
+        let response = client.get(format!("http://{address}")).send().await;
+
+        assert!(response.is_err_and(|error| error.is_timeout()));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        server.abort();
+        Ok(())
+    }
 
     #[tokio::test]
     async fn null_terminated_response() {
@@ -370,5 +475,42 @@ mod tests {
 
         assert!(is_expected_write_error(&read_timeout));
         assert!(!is_expected_write_error(&write_timeout));
+    }
+
+    #[test]
+    fn last_share_time_accepts_unix_timestamps() {
+        assert_eq!(
+            parse_last_share_time_at(&json!(1_761_061_364), 2_000_000_000),
+            Some(1_761_061_364)
+        );
+        assert_eq!(
+            parse_last_share_time_at(&json!("1761061364"), 2_000_000_000),
+            Some(1_761_061_364)
+        );
+    }
+
+    #[test]
+    fn last_share_time_converts_relative_duration() {
+        assert_eq!(
+            parse_last_share_time_at(&json!("0:00:03"), 2_000_000_000),
+            Some(1_999_999_997)
+        );
+        assert_eq!(
+            parse_last_share_time_at(&json!("1:02:03:04"), 2_000_000_000),
+            Some(1_999_906_216)
+        );
+    }
+
+    #[test]
+    fn last_share_time_rejects_missing_or_ambiguous_values() {
+        assert_eq!(parse_last_share_time_at(&json!(0), 2_000_000_000), None);
+        assert_eq!(
+            parse_last_share_time_at(&json!(31_279), 2_000_000_000),
+            None
+        );
+        assert_eq!(
+            parse_last_share_time_at(&json!("not available"), 2_000_000_000),
+            None
+        );
     }
 }

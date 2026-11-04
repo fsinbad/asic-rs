@@ -91,7 +91,8 @@ impl APIClient for WhatsMinerV2 {
         match command {
             MinerCommand::RPC { .. } => self.rpc.get_api_result(command).await,
             _ => Err(anyhow::anyhow!(
-                "Unsupported command type for WhatsMiner API"
+                "Unsupported command type for {} API",
+                WhatsMinerFirmware::default()
             )),
         }
     }
@@ -307,6 +308,7 @@ impl GetMAC for WhatsMinerV2 {
 }
 
 impl GetSerialNumber for WhatsMinerV2 {}
+impl SupportsTimezoneConfig for WhatsMinerV2 {}
 impl GetHostname for WhatsMinerV2 {
     fn parse_hostname(&self, data: &HashMap<DataField, Value>) -> Option<String> {
         data.extract::<String>(DataField::Hostname)
@@ -353,9 +355,9 @@ impl GetHashboards for WhatsMinerV2 {
                     HashRate {
                         value: f,
                         unit: HashRateUnit::MegaHash,
-                        algo: "SHA256".to_string(),
+                        algo: self.device_info.algo,
                     }
-                    .as_unit(HashRateUnit::default())
+                    .as_default_unit()
                 });
             board.expected_hashrate = hashboard_data
                 .pointer(&format!("/DEVS/{idx}/Factory GHS"))
@@ -364,9 +366,9 @@ impl GetHashboards for WhatsMinerV2 {
                     HashRate {
                         value: f,
                         unit: HashRateUnit::GigaHash,
-                        algo: "SHA256".to_string(),
+                        algo: self.device_info.algo,
                     }
-                    .as_unit(HashRateUnit::default())
+                    .as_default_unit()
                 });
             board.board_temperature = hashboard_data
                 .pointer(&format!("/DEVS/{idx}/Temperature"))
@@ -410,9 +412,9 @@ impl GetHashrate for WhatsMinerV2 {
             HashRate {
                 value: f,
                 unit: HashRateUnit::MegaHash,
-                algo: "SHA256".to_string(),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default())
+            .as_default_unit()
         })
     }
 }
@@ -422,9 +424,9 @@ impl GetExpectedHashrate for WhatsMinerV2 {
             HashRate {
                 value: f,
                 unit: HashRateUnit::GigaHash,
-                algo: "SHA256".to_string(),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default())
+            .as_default_unit()
         })
     }
 }
@@ -461,6 +463,7 @@ impl GetPsuFans for WhatsMinerV2 {
         psu_fans
     }
 }
+impl GetPsus for WhatsMinerV2 {}
 impl GetFluidTemperature for WhatsMinerV2 {
     fn parse_fluid_temperature(&self, data: &HashMap<DataField, Value>) -> Option<Temperature> {
         data.extract_map::<f64, _>(DataField::FluidTemperature, Temperature::from_celsius)
@@ -549,6 +552,13 @@ impl GetUptime for WhatsMinerV2 {
         data.extract_map::<u64, _>(DataField::Uptime, Duration::from_secs)
     }
 }
+
+impl GetBestShare for WhatsMinerV2 {}
+impl GetSessionBestShare for WhatsMinerV2 {}
+impl GetOperatingState for WhatsMinerV2 {}
+
+impl GetDevFeeConnected for WhatsMinerV2 {}
+
 impl GetIsMining for WhatsMinerV2 {
     fn parse_is_mining(&self, data: &HashMap<DataField, Value>) -> bool {
         // mineroff: "true" means mining is OFF
@@ -592,11 +602,16 @@ impl GetPools for WhatsMinerV2 {
                     .and_then(|val| val.pointer(&format!("/{idx}/Rejected")))
                     .and_then(|val| val.as_u64());
 
+                let last_share_time = pools_raw
+                    .and_then(|val| val.pointer(&format!("/{idx}/Last Share Time")))
+                    .and_then(asic_rs_core::util::parse_last_share_time);
+
                 pools.push(PoolData {
                     position: Some(idx as u16),
                     url,
                     accepted_shares,
                     rejected_shares,
+                    last_share_time,
                     active,
                     alive,
                     user,
@@ -747,6 +762,9 @@ impl FactoryReset for WhatsMinerV2 {
     }
 }
 
+impl RestartMining for WhatsMinerV2 {}
+impl RestoreStockOs for WhatsMinerV2 {}
+
 #[async_trait]
 impl SupportsScalingConfig for WhatsMinerV2 {
     fn supports_scaling_config(&self) -> bool {
@@ -785,6 +803,12 @@ impl Validate for WhatsMinerV2 {
 /// Maps a TuningConfig to the WhatsMiner V2 RPC command name and parameter.
 fn tuning_config_to_rpc(config: &TuningConfig) -> anyhow::Result<(&'static str, Option<Value>)> {
     match &config.target {
+        TuningTarget::Manual { .. } => {
+            anyhow::bail!(
+                "Manual tuning target is not supported on {}",
+                WhatsMinerFirmware::default()
+            )
+        }
         TuningTarget::MiningMode(mode) => {
             let cmd = match mode {
                 MiningMode::Low => "set_low_power",
@@ -798,7 +822,16 @@ fn tuning_config_to_rpc(config: &TuningConfig) -> anyhow::Result<(&'static str, 
             Some(json!({"power_limit": limit.as_watts().to_string()})),
         )),
         TuningTarget::HashRate(_) => {
-            anyhow::bail!("HashRate tuning target is not supported on WhatsMiner")
+            anyhow::bail!(
+                "HashRate tuning target is not supported on {}",
+                WhatsMinerFirmware::default()
+            )
+        }
+        TuningTarget::Preset(_) => {
+            anyhow::bail!(
+                "Preset tuning target is not supported on {}",
+                WhatsMinerFirmware::default()
+            )
         }
     }
 }
@@ -933,7 +966,7 @@ mod tests {
         let config = TuningConfig::new(TuningTarget::HashRate(HashRate {
             value: 200.0,
             unit: HashRateUnit::TeraHash,
-            algo: "SHA256".to_string(),
+            algo: HashAlgorithm::SHA256,
         }));
         let result = tuning_config_to_rpc(&config);
 
@@ -1098,7 +1131,7 @@ mod integration_tests {
             Some(HashRate {
                 value: 124.5,
                 unit: HashRateUnit::TeraHash,
-                algo: "SHA256".to_string(),
+                algo: HashAlgorithm::SHA256,
             })
         );
         assert_eq!(
@@ -1106,7 +1139,7 @@ mod integration_tests {
             Some(HashRate {
                 value: 126.0,
                 unit: HashRateUnit::TeraHash,
-                algo: "SHA256".to_string(),
+                algo: HashAlgorithm::SHA256,
             })
         );
         assert_eq!(miner_data.wattage, Some(Power::from_watts(3200.0)));
@@ -1216,4 +1249,7 @@ mod integration_tests {
 
 impl SupportsTemperatureConfig for WhatsMinerV2 {}
 impl GetTuningPercent for WhatsMinerV2 {}
+impl SetHashboardsEnabled for WhatsMinerV2 {}
+
 impl SetTuningPercent for WhatsMinerV2 {}
+impl SupportsPresets for WhatsMinerV2 {}

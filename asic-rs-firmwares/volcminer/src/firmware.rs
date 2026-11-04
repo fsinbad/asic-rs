@@ -1,7 +1,7 @@
 use std::{fmt::Display, net::IpAddr};
 
 use asic_rs_core::{
-    data::command::MinerCommand,
+    data::command::DiscoveryCommand,
     discovery::HTTP_WEB_ROOT,
     errors::ModelSelectionError,
     traits::{
@@ -11,7 +11,6 @@ use asic_rs_core::{
         identification::{FirmwareIdentification, WebResponse},
         make::MinerMake,
         miner::{HasDefaultAuth, Miner, MinerAuth, MinerConstructor},
-        model::MinerModel,
     },
 };
 use asic_rs_makes_volcminer::{make::VolcMinerMake, models::VolcMinerModel};
@@ -30,7 +29,7 @@ impl Display for VolcMinerStockFirmware {
 }
 
 impl DiscoveryCommands for VolcMinerStockFirmware {
-    fn get_discovery_commands(&self) -> Vec<MinerCommand> {
+    fn get_discovery_commands(&self) -> Vec<DiscoveryCommand> {
         vec![HTTP_WEB_ROOT]
     }
 }
@@ -80,7 +79,9 @@ async fn get_version_with_auth(ip: IpAddr, auth: &MinerAuth) -> Option<semver::V
 
 #[async_trait]
 impl MinerFirmware for VolcMinerStockFirmware {
-    async fn get_model(ip: IpAddr) -> Result<impl MinerModel + Send, ModelSelectionError> {
+    type Model = VolcMinerModel;
+
+    async fn get_model(ip: IpAddr) -> Result<Self::Model, ModelSelectionError> {
         let default = VolcMinerV1::default_auth();
         get_model_with_auth(ip, &default).await
     }

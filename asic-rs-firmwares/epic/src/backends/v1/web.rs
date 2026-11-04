@@ -165,11 +165,78 @@ impl PowerPlayWebAPI {
                 miner_ip = %self.ip,
                 endpoint = "/systemupdate",
                 error = error,
-                "ePIC firmware update API returned result=false"
+                "{} firmware update API returned result=false",
+                crate::firmware::EPicFirmware::default()
             );
         }
 
         Ok(result)
+    }
+
+    pub async fn supports_uninstall(&self) -> anyhow::Result<bool> {
+        let capabilities = self
+            .send_command("capabilities", false, None, Method::GET)
+            .await?;
+        Ok(capabilities
+            .get("UninstallSupported")
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
+    }
+
+    /// Queue the UMC OS uninstall script and restore the manufacturer stock OS.
+    ///
+    /// A successful response only confirms that the script was queued; the
+    /// restore continues after this request returns.
+    pub async fn uninstall(&self) -> anyhow::Result<()> {
+        let response = self
+            .send_command(
+                "uninstall",
+                true,
+                Some(json!({ "param": null })),
+                Method::POST,
+            )
+            .await?;
+
+        match response.get("result").and_then(Value::as_bool) {
+            Some(true) => Ok(()),
+            Some(false) => {
+                let error = match response.get("error") {
+                    Some(Value::String(error)) => error.clone(),
+                    Some(error) if !error.is_null() => error.to_string(),
+                    _ => "unknown error".to_string(),
+                };
+                bail!("UMC OS uninstall request failed: {error}")
+            }
+            None => bail!("Invalid UMC OS uninstall response: missing boolean result"),
+        }
+    }
+
+    /// Restart the mining program without a full hardware power cycle.
+    ///
+    /// UMC calls this a soft reboot: the operating system keeps running. A
+    /// successful response only confirms that the request was accepted.
+    pub async fn soft_reboot(&self) -> anyhow::Result<()> {
+        let response = self
+            .send_command(
+                "softreboot",
+                true,
+                Some(json!({ "param": null })),
+                Method::POST,
+            )
+            .await?;
+
+        match response.get("result").and_then(Value::as_bool) {
+            Some(true) => Ok(()),
+            Some(false) => {
+                let error = match response.get("error") {
+                    Some(Value::String(error)) => error.clone(),
+                    Some(error) if !error.is_null() => error.to_string(),
+                    _ => "unknown error".to_string(),
+                };
+                bail!("UMC soft reboot request failed: {error}")
+            }
+            None => bail!("Invalid UMC soft reboot response: missing boolean result"),
+        }
     }
 
     pub async fn change_password(&self, password: &str) -> anyhow::Result<bool> {

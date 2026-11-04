@@ -53,17 +53,36 @@ impl WebAPIClient for BraiinsWebAPI {
 
         let url = format!("http://{}:{}/api/v1/{}", self.ip, self.port, command);
 
-        let response = self.execute_request(&url, &method, parameters).await?;
+        let mut response = self
+            .execute_request(&url, &method, parameters.clone())
+            .await?;
+
+        if response.status().as_u16() == 401 {
+            *self.bearer_token.write().await = None;
+            self.ensure_authenticated().await?;
+            response = self.execute_request(&url, &method, parameters).await?;
+        }
 
         let status = response.status();
         if status.is_success() {
-            let json_data = response
-                .json()
+            let body = response
+                .bytes()
                 .await
                 .map_err(|e| BraiinsError::ParseError(e.to_string()))?;
-            Ok(json_data)
+            if body.iter().all(|byte| byte.is_ascii_whitespace()) {
+                Ok(Value::Null)
+            } else {
+                serde_json::from_slice(&body)
+                    .map_err(|e| BraiinsError::ParseError(e.to_string()).into())
+            }
         } else {
-            Err(BraiinsError::HttpError(status.as_u16()))?
+            // The API reports why it rejected a request in the body.
+            let status = status.as_u16();
+            let body = response.text().await.unwrap_or_default();
+            Err(match status {
+                401 => BraiinsError::Unauthorized,
+                _ => BraiinsError::HttpError { status, body },
+            })?
         }
     }
 }
@@ -79,6 +98,13 @@ impl BraiinsWebAPI {
             bearer_token: RwLock::new(None),
             auth,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_with_port(ip: IpAddr, port: u16, auth: MinerAuth) -> Self {
+        let mut api = Self::new(ip, auth);
+        api.port = port;
+        api
     }
 
     pub fn set_auth(&mut self, auth: MinerAuth) {
@@ -164,6 +190,16 @@ impl BraiinsWebAPI {
 
         let logs = response.text().await?;
         Ok(logs)
+    }
+
+    /// Start restoring the manufacturer stock OS.
+    ///
+    /// A successful response only confirms that the background restoration
+    /// task started; the miner becomes unreachable while it proceeds.
+    pub async fn restore_stock_os(&self) -> anyhow::Result<()> {
+        self.send_command("upgrade/restore-stock", true, None, Method::POST)
+            .await?;
+        Ok(())
     }
 
     /// Execute the actual HTTP request
@@ -281,8 +317,8 @@ impl BraiinsWebAPI {
 pub enum BraiinsError {
     /// Network error (connection issues, DNS resolution, etc.)
     NetworkError(String),
-    /// HTTP error with status code
-    HttpError(u16),
+    /// HTTP error with status code and response body
+    HttpError { status: u16, body: String },
     /// JSON parsing error
     ParseError(String),
     /// Request building error
@@ -303,7 +339,10 @@ impl std::fmt::Display for BraiinsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BraiinsError::NetworkError(msg) => write!(f, "Network error: {msg}"),
-            BraiinsError::HttpError(code) => write!(f, "HTTP error: {code}"),
+            BraiinsError::HttpError { status, body } if !body.trim().is_empty() => {
+                write!(f, "HTTP error: {status}: {}", body.trim())
+            }
+            BraiinsError::HttpError { status, .. } => write!(f, "HTTP error: {status}"),
             BraiinsError::ParseError(msg) => write!(f, "Parse error: {msg}"),
             BraiinsError::RequestError(msg) => write!(f, "Request error: {msg}"),
             BraiinsError::Timeout => write!(f, "Request timeout"),

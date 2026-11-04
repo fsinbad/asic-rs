@@ -22,11 +22,11 @@ use asic_rs_core::{
         hashrate::{HashRate, HashRateUnit},
         message::{MessageSeverity, MinerMessage},
         miner::{MiningMode, TuningTarget},
-        pool::{PoolData, PoolGroupData, PoolURL},
+        pool::{PoolData, PoolGroupData, PoolScheme, PoolURL},
     },
     traits::{miner::*, model::MinerModel},
 };
-use asic_rs_makes_antminer::hardware::AntMinerControlBoard;
+use asic_rs_makes_antminer::{hardware::AntMinerControlBoard, models::AntMinerModel};
 use async_trait::async_trait;
 use macaddr::MacAddr;
 use measurements::{AngularVelocity, Frequency, Power, Temperature};
@@ -48,6 +48,7 @@ pub struct AntMinerV202307 {
 }
 
 #[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum MinerMode {
     Sleep,
     Low,
@@ -129,6 +130,49 @@ fn browser_miner_conf_payload(miner_conf: &Value) -> serde_json::Map<String, Val
     payload
 }
 
+/// `set_miner_conf.cgi` only overwrites the pool slots it is sent, so a list
+/// shorter than the miner's three slots leaves the old trailing pools in
+/// place. Blank the unused slots so they are removed.
+fn pools_payload(config: Vec<PoolGroupConfig>) -> anyhow::Result<Vec<Value>> {
+    let mut pools: Vec<Value> = config
+        .into_iter()
+        .flat_map(|group| group.pools.into_iter())
+        .map(|pool| {
+            if pool.url.scheme != PoolScheme::StratumV1 || pool.url.pubkey.is_some() {
+                anyhow::bail!("stock Antminer pools require a stratum+tcp URL");
+            }
+            // The CGI rejects the scheme prefix with code M001, even though
+            // PoolURL::Display includes it.
+            Ok(json!({
+                "url": format!("{}:{}", pool.url.host, pool.url.port),
+                "user": pool.username,
+                "pass": pool.password,
+            }))
+        })
+        .collect::<anyhow::Result<_>>()?;
+
+    if pools.len() > 3 {
+        anyhow::bail!("stock Antminer supports at most three pools");
+    }
+
+    pools.resize(3, json!({ "url": "", "user": "", "pass": "" }));
+    Ok(pools)
+}
+
+fn miner_conf_with_pools(miner_conf: &Value, pools: Vec<Value>) -> Value {
+    let mut payload = browser_miner_conf_payload(miner_conf);
+    payload.insert("pools".to_string(), Value::Array(pools));
+    Value::Object(payload)
+}
+
+fn miner_conf_with_read_shape_pools(miner_conf: &Value, pools: Vec<Value>) -> Option<Value> {
+    let mut payload = miner_conf.clone();
+    payload
+        .as_object_mut()?
+        .insert("pools".to_string(), Value::Array(pools));
+    Some(payload)
+}
+
 fn miner_conf_with_miner_mode(miner_conf: &Value, mode: MinerMode) -> Option<Value> {
     miner_mode_config_key(miner_conf)?;
     let mut payload = browser_miner_conf_payload(miner_conf);
@@ -136,6 +180,44 @@ fn miner_conf_with_miner_mode(miner_conf: &Value, mode: MinerMode) -> Option<Val
     payload.insert("miner-mode".to_string(), mode.clone());
     payload.insert("bitmain-work-mode".to_string(), mode);
     Some(Value::Object(payload))
+}
+
+fn miner_conf_with_read_shape_mode(miner_conf: &Value, mode: MinerMode) -> Option<Value> {
+    let mode_key = miner_mode_config_key(miner_conf)?;
+    let mut payload = miner_conf.clone();
+    let object = payload.as_object_mut()?;
+    let current = object.get(mode_key)?;
+    let mode_value = if current.is_string() {
+        Value::String(mode.to_string())
+    } else {
+        Value::from(mode.as_web_value())
+    };
+    object.insert(mode_key.to_string(), mode_value);
+    Some(payload)
+}
+
+fn miner_conf_write_accepted(response: &Value) -> bool {
+    match response.get("code").and_then(Value::as_str) {
+        Some("M000") => true,
+        Some(_) => false,
+        None => response.get("stats").and_then(Value::as_str) == Some("success"),
+    }
+}
+
+fn is_sleep_status(value: &Value) -> bool {
+    matches!(
+        value.as_str().map(str::to_ascii_lowercase).as_deref(),
+        Some("stopped" | "idle" | "sleep")
+    ) || matches!(u64_from_value(value), Some(1 | 5))
+}
+
+fn miner_conf_has_mode(miner_conf: &Value, mode: MinerMode) -> bool {
+    let value = miner_mode_config_key(miner_conf).and_then(|key| miner_conf.get(key));
+    if mode == MinerMode::Sleep {
+        value.is_some_and(is_sleep_status)
+    } else {
+        value.and_then(u64_from_value) == Some(u64::from(mode.as_web_value()))
+    }
 }
 
 fn miner_mode_from_value(mode: &Value) -> Option<MiningMode> {
@@ -177,19 +259,130 @@ fn u64_from_value(value: &Value) -> Option<u64> {
         .or_else(|| value.as_str().and_then(|s| s.parse::<u64>().ok()))
 }
 
+fn equihash_display_unit(value: &Value) -> Option<HashRateUnit> {
+    let unit = value
+        .as_str()?
+        .split_whitespace()
+        .last()?
+        .to_ascii_lowercase();
+    match unit.as_str() {
+        "sol/s" => Some(HashRateUnit::Hash),
+        "ksol/s" => Some(HashRateUnit::KiloHash),
+        "msol/s" => Some(HashRateUnit::MegaHash),
+        "gsol/s" => Some(HashRateUnit::GigaHash),
+        _ => None,
+    }
+}
+
+fn equihash_summary_unit(summary: &Value) -> Option<HashRateUnit> {
+    summary
+        .get("AV HASHRATE")
+        .or_else(|| summary.get("RT HASHRATE"))
+        .and_then(equihash_display_unit)
+}
+
 impl AntMinerV202307 {
     pub fn new(ip: IpAddr, model: impl MinerModel) -> Self {
         let auth = Self::default_auth();
+        let algo = model.hash_algorithm();
         AntMinerV202307 {
             ip,
             rpc: AntMinerRPCAPI::new(ip),
             web: AntMinerWebAPI::new(ip, auth),
-            device_info: DeviceInfo::new(
-                model,
-                AntMinerStockFirmware::default(),
-                HashAlgorithm::SHA256,
-            ),
+            device_info: DeviceInfo::new(model, AntMinerStockFirmware::default(), algo),
         }
+    }
+
+    async fn set_miner_mode(&self, mode: MinerMode) -> anyhow::Result<bool> {
+        let pre = self.web.get_miner_conf().await?;
+        let Some(normalized) = miner_conf_with_miner_mode(&pre, mode) else {
+            return Ok(false);
+        };
+
+        let response = self.web.set_miner_conf(normalized).await?;
+        if miner_conf_write_accepted(&response)
+            && (mode != MinerMode::Sleep || self.miner_conf_reports_mode(mode).await)
+        {
+            return Ok(true);
+        }
+
+        // Some S21Plus firmware rejects the browser-shaped payload with M001.
+        // Its cminer proxy accepts the full read-side configuration with only
+        // the existing mode field changed.
+        let Some(read_shape) = miner_conf_with_read_shape_mode(&pre, mode) else {
+            return Ok(false);
+        };
+        let response = self.web.set_miner_conf(read_shape).await?;
+        if !miner_conf_write_accepted(&response) {
+            return Ok(false);
+        }
+
+        // Resume can restart cminer before an immediate read.
+        Ok(mode != MinerMode::Sleep || self.miner_conf_reports_mode(mode).await)
+    }
+
+    async fn miner_conf_reports_mode(&self, mode: MinerMode) -> bool {
+        self.web
+            .get_miner_conf()
+            .await
+            .is_ok_and(|conf| miner_conf_has_mode(&conf, mode))
+    }
+
+    /// Read a numeric field that some firmware generations emit as a JSON
+    /// number and others as a quoted string.
+    fn parse_f64_field(value: &Value) -> Option<f64> {
+        value
+            .as_f64()
+            .or_else(|| value.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+    }
+
+    fn parse_ks5_hashrate(&self, aggregate: &Value) -> Option<HashRate> {
+        let mut fields = Vec::new();
+        if let Some(raw) = aggregate.get("rate_5s") {
+            let unit = HashRateUnit::from_str(aggregate.get("rate_unit")?.as_str()?).ok()?;
+            if matches!(unit, HashRateUnit::Sol | HashRateUnit::KiloSol) {
+                return None;
+            }
+            fields.push((raw, unit));
+        }
+        for (key, unit) in [
+            ("THS 5s", HashRateUnit::TeraHash),
+            ("GHS 5s", HashRateUnit::GigaHash),
+            ("MHS 5s", HashRateUnit::MegaHash),
+            ("KHS 5s", HashRateUnit::KiloHash),
+            ("HS 5s", HashRateUnit::Hash),
+        ] {
+            if let Some(raw) = aggregate.get(key) {
+                fields.push((raw, unit));
+            }
+        }
+        let mut current: Option<HashRate> = None;
+        for (raw, unit) in fields {
+            let value = Self::parse_f64_field(raw)?;
+            if !value.is_finite() || value < 0.0 {
+                return None;
+            }
+            let rate = HashRate {
+                value,
+                unit,
+                algo: self.device_info.algo,
+            }
+            .as_default_unit();
+            if !rate.value.is_finite() {
+                return None;
+            }
+            if let Some(first) = &current {
+                let tolerance = 1e-6_f64.max(first.value.abs() * 1e-6);
+                if (first.value == 0.0) != (rate.value == 0.0)
+                    || (first.value - rate.value).abs() > tolerance
+                {
+                    return None;
+                }
+            } else {
+                current = Some(rate);
+            }
+        }
+        current
     }
 
     fn parse_temp_string(temp_str: &str) -> Option<Temperature> {
@@ -286,7 +479,10 @@ impl APIClient for AntMinerV202307 {
         match command {
             MinerCommand::RPC { .. } => self.rpc.get_api_result(command).await,
             MinerCommand::WebAPI { .. } => self.web.get_api_result(command).await,
-            _ => Err(anyhow::anyhow!("Unsupported command type for Antminer API")),
+            _ => Err(anyhow::anyhow!(
+                "Unsupported command type for {} API",
+                AntMinerStockFirmware::default()
+            )),
         }
     }
 }
@@ -413,22 +609,76 @@ impl GetDataLocations for AntMinerV202307 {
                     tag: None,
                 },
             )],
+            DataField::Hashrate
+                if self.device_info.model == AntMinerModel::KS5.to_string()
+                    || self.device_info.model == AntMinerModel::KS5Pro.to_string() =>
+            {
+                vec![
+                    (
+                        RPC_SUMMARY,
+                        DataExtractor {
+                            func: get_by_pointer,
+                            key: Some("/SUMMARY"),
+                            tag: Some("summary"),
+                        },
+                    ),
+                    (
+                        MinerCommand::WebAPI {
+                            command: "stats",
+                            parameters: None,
+                        },
+                        DataExtractor {
+                            func: get_by_pointer,
+                            key: Some("/STATS"),
+                            tag: Some("stats"),
+                        },
+                    ),
+                ]
+            }
+            // cgminer names its summary keys after the unit they are in —
+            // `GHS 5s` on SHA-256 models, `MHS 5s` on Scrypt ones — so keep
+            // the whole entry and let the parse pick the key that is present.
             DataField::Hashrate => vec![(
                 RPC_SUMMARY,
                 DataExtractor {
                     func: get_by_pointer,
-                    key: Some("/SUMMARY/0/GHS 5s"),
+                    key: Some("/SUMMARY/0"),
                     tag: None,
                 },
             )],
-            DataField::ExpectedHashrate => vec![(
-                RPC_STATS,
-                DataExtractor {
-                    func: get_by_pointer,
-                    key: Some("/STATS/1/total_rateideal"),
-                    tag: None,
-                },
-            )],
+            // `total_rateideal`, by contrast, says nothing about its own
+            // scale, so carry STATS' `rate_unit` alongside it.
+            DataField::ExpectedHashrate => {
+                let mut locations = vec![
+                    (
+                        RPC_STATS,
+                        DataExtractor {
+                            func: get_by_pointer,
+                            key: Some("/STATS/1/total_rateideal"),
+                            tag: Some("hashrate"),
+                        },
+                    ),
+                    (
+                        RPC_STATS,
+                        DataExtractor {
+                            func: get_by_pointer,
+                            key: Some("/STATS/1/rate_unit"),
+                            tag: Some("unit"),
+                        },
+                    ),
+                ];
+                if self.device_info.algo == HashAlgorithm::Equihash {
+                    locations.push((
+                        RPC_SUMMARY,
+                        DataExtractor {
+                            func: get_by_pointer,
+                            key: Some("/SUMMARY/0"),
+                            tag: Some("summary"),
+                        },
+                    ));
+                }
+                locations
+            }
             DataField::Fans => vec![(
                 RPC_STATS,
                 DataExtractor {
@@ -437,14 +687,27 @@ impl GetDataLocations for AntMinerV202307 {
                     tag: None,
                 },
             )],
-            DataField::Hashboards => vec![(
-                RPC_STATS,
-                DataExtractor {
-                    func: get_by_pointer,
-                    key: Some("/STATS/1"),
-                    tag: None,
-                },
-            )],
+            DataField::Hashboards => {
+                let mut locations = vec![(
+                    RPC_STATS,
+                    DataExtractor {
+                        func: get_by_pointer,
+                        key: Some("/STATS/1"),
+                        tag: None,
+                    },
+                )];
+                if self.device_info.algo == HashAlgorithm::Equihash {
+                    locations.push((
+                        RPC_SUMMARY,
+                        DataExtractor {
+                            func: get_by_pointer,
+                            key: Some("/SUMMARY/0"),
+                            tag: Some("summary"),
+                        },
+                    ));
+                }
+                locations
+            }
             DataField::LightFlashing => vec![(
                 WEB_BLINK_STATUS,
                 DataExtractor {
@@ -477,14 +740,32 @@ impl GetDataLocations for AntMinerV202307 {
                     tag: None,
                 },
             )],
-            DataField::Wattage => vec![(
-                RPC_STATS,
-                DataExtractor {
-                    func: get_by_pointer,
-                    key: Some("/STATS/1"),
-                    tag: None,
-                },
-            )],
+            DataField::Wattage => {
+                // Not a `const` because `json!` is not const-evaluable.
+                let rpc_new_stats = MinerCommand::RPC {
+                    command: "stats",
+                    parameters: Some(json!({ "new_api": true })),
+                };
+
+                vec![
+                    (
+                        RPC_STATS,
+                        DataExtractor {
+                            func: get_by_pointer,
+                            key: Some("/STATS/1"),
+                            tag: None,
+                        },
+                    ),
+                    (
+                        rpc_new_stats,
+                        DataExtractor {
+                            func: get_by_pointer,
+                            key: Some("/STATS/0"),
+                            tag: None,
+                        },
+                    ),
+                ]
+            }
             DataField::SerialNumber => vec![
                 (
                     WEB_SYSTEM_INFO,
@@ -580,26 +861,48 @@ impl GetHashboards for AntMinerV202307 {
             return hashboards;
         };
 
+        let algo = self.device_info.algo;
+        let unit = if algo == HashAlgorithm::Equihash {
+            stats_data.get("summary").and_then(equihash_summary_unit)
+        } else {
+            None
+        }
+        .or_else(|| {
+            stats_data
+                .get("rate_unit")
+                .and_then(|v| v.as_str())
+                .and_then(|s| HashRateUnit::from_str(s).ok())
+        })
+        .unwrap_or(HashRateUnit::GigaHash);
+
         for board in hashboards.iter_mut() {
             let idx = board.position + 1;
 
             board.hashrate = stats_data
                 .get(&format!("chain_rate{idx}"))
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<f64>().ok())
+                .and_then(Self::parse_f64_field)
                 .map(|r| {
                     HashRate {
                         value: r,
-                        unit: HashRateUnit::GigaHash,
-                        algo: "SHA256".to_string(),
+                        unit,
+                        algo,
                     }
-                    .as_unit(HashRateUnit::default())
+                    .as_default_unit()
                 });
 
+            // `temp_pcb{idx}` on older generations; newer ones split the
+            // reading into inlet/outlet pairs and omit the combined key.
             board.board_temperature = stats_data
                 .get(&format!("temp_pcb{idx}"))
                 .and_then(|v| v.as_str())
-                .and_then(Self::parse_temp_string);
+                .and_then(Self::parse_temp_string)
+                .or_else(|| {
+                    stats_data
+                        .get(&format!("temp_out_pcb_{idx}"))
+                        .and_then(Self::parse_f64_field)
+                        .filter(|&t| t > 0.0)
+                        .map(Temperature::from_celsius)
+                });
 
             board.working_chips = stats_data
                 .get(&format!("chain_acn{idx}"))
@@ -627,27 +930,92 @@ impl GetHashboards for AntMinerV202307 {
 
 impl GetHashrate for AntMinerV202307 {
     fn parse_hashrate(&self, data: &HashMap<DataField, Value>) -> Option<HashRate> {
-        data.extract_map::<f64, _>(DataField::Hashrate, |f| {
-            HashRate {
-                value: f,
-                unit: HashRateUnit::GigaHash,
-                algo: "SHA256".to_string(),
+        let summary_value = data.get(&DataField::Hashrate)?;
+        if self.device_info.model == AntMinerModel::KS5.to_string()
+            || self.device_info.model == AntMinerModel::KS5Pro.to_string()
+        {
+            if let Some([summary]) = summary_value
+                .get("summary")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                && let Some(rate) = self.parse_ks5_hashrate(summary)
+            {
+                return Some(rate);
             }
-            .as_unit(HashRateUnit::default())
-        })
+            // KS5 RPC rate can be chart history; CGI stats supplies the current rate.
+            let [stats] = summary_value.get("stats")?.as_array()?.as_slice() else {
+                return None;
+            };
+            return self.parse_ks5_hashrate(stats);
+        }
+        let summary = summary_value.as_object()?;
+
+        // cgminer names its rate keys `<unit> <window>` — `GHS 5s` on SHA-256
+        // models, `MHS 5s` on Scrypt ones — so the key states its own unit.
+        // Prefer the 5-second window and fall back to the average.
+        let (value, unit) = ["5s", "av"].into_iter().find_map(|window| {
+            summary.iter().find_map(|(key, raw)| {
+                let (unit, key_window) = key.split_once(' ')?;
+                if key_window != window {
+                    return None;
+                }
+                Some((
+                    Self::parse_f64_field(raw)?,
+                    HashRateUnit::from_str(unit).ok()?,
+                ))
+            })
+        })?;
+
+        // Equihash firmware may label the numeric field `GHS` while its
+        // human-readable rate states the actual Sol/s scale.
+        let unit = if self.device_info.algo == HashAlgorithm::Equihash {
+            equihash_summary_unit(summary_value).unwrap_or(unit)
+        } else {
+            unit
+        };
+
+        Some(
+            HashRate {
+                value,
+                unit,
+                algo: self.device_info.algo,
+            }
+            .as_default_unit(),
+        )
     }
 }
 
 impl GetExpectedHashrate for AntMinerV202307 {
     fn parse_expected_hashrate(&self, data: &HashMap<DataField, Value>) -> Option<HashRate> {
-        data.extract_map::<f64, _>(DataField::ExpectedHashrate, |f| {
+        let field = data.get(&DataField::ExpectedHashrate);
+        let value = field?
+            .pointer("/hashrate")
+            .and_then(Self::parse_f64_field)?;
+        let displayed_unit = if self.device_info.algo == HashAlgorithm::Equihash {
+            field
+                .and_then(|value| value.get("summary"))
+                .or_else(|| data.get(&DataField::Hashrate))
+                .and_then(equihash_summary_unit)
+        } else {
+            None
+        };
+        Some(
             HashRate {
-                value: f,
-                unit: HashRateUnit::GigaHash,
-                algo: "SHA256".to_string(),
+                value,
+                // `total_rateideal` does not name its own scale, so take it
+                // from STATS' `rate_unit` (`"GH"` / `"MH"`).
+                unit: displayed_unit
+                    .or_else(|| {
+                        field
+                            .and_then(|v| v.pointer("/unit"))
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| HashRateUnit::from_str(s).ok())
+                    })
+                    .unwrap_or(HashRateUnit::GigaHash),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default())
-        })
+            .as_default_unit(),
+        )
     }
 }
 
@@ -688,18 +1056,16 @@ impl GetUptime for AntMinerV202307 {
     }
 }
 
+impl GetBestShare for AntMinerV202307 {}
+impl GetSessionBestShare for AntMinerV202307 {}
+
+impl GetOperatingState for AntMinerV202307 {}
+
+impl GetDevFeeConnected for AntMinerV202307 {}
+
 impl GetIsMining for AntMinerV202307 {
     fn parse_is_mining(&self, data: &HashMap<DataField, Value>) -> bool {
-        data.extract::<String>(DataField::IsMining)
-            .map(|status| {
-                let status_lower = status.to_lowercase();
-                status_lower != "stopped"
-                    && status_lower != "idle"
-                    && status_lower != "sleep"
-                    && status_lower != "1"
-                    && status_lower != "5"
-            })
-            .unwrap_or(true)
+        !data.get(&DataField::IsMining).is_some_and(is_sleep_status)
     }
 }
 
@@ -728,6 +1094,10 @@ impl GetPools for AntMinerV202307 {
 
             let rejected_shares = pool_info.get("Rejected").and_then(|v| v.as_u64());
 
+            let last_share_time = pool_info
+                .get("Last Share Time")
+                .and_then(asic_rs_core::util::parse_last_share_time);
+
             let active = pool_info.get("Stratum Active").and_then(|v| v.as_bool());
 
             let alive = pool_info
@@ -745,6 +1115,7 @@ impl GetPools for AntMinerV202307 {
                 url,
                 accepted_shares,
                 rejected_shares,
+                last_share_time,
                 active,
                 alive,
                 user,
@@ -796,6 +1167,9 @@ impl GetWattage for AntMinerV202307 {
             if let Some(power) = stats_data
                 .get("power")
                 .or_else(|| stats_data.get("Power"))
+                // Same firmware version spells this differently per model: the
+                // L9 reports `power`, the L11 `watt`.
+                .or_else(|| stats_data.get("watt"))
                 .and_then(|v| v.as_f64())
             {
                 return Some(Power::from_watts(power));
@@ -854,7 +1228,9 @@ impl GetFluidTemperature for AntMinerV202307 {
 }
 
 impl GetPsuFans for AntMinerV202307 {}
+impl GetPsus for AntMinerV202307 {}
 impl GetTuningCapabilities for AntMinerV202307 {}
+impl SupportsTimezoneConfig for AntMinerV202307 {}
 
 impl GetMessages for AntMinerV202307 {
     fn parse_messages(&self, data: &HashMap<DataField, Value>) -> Vec<MinerMessage> {
@@ -895,9 +1271,11 @@ impl SetFaultLight for AntMinerV202307 {
         true
     }
 
-    #[allow(unused_variables)]
     async fn set_fault_light(&self, fault: bool) -> anyhow::Result<bool> {
-        Ok(self.web.blink(fault).await.is_ok())
+        Ok(super::blink_response_matches(
+            &self.web.blink(fault).await?,
+            fault,
+        ))
     }
 }
 
@@ -963,25 +1341,33 @@ impl SupportsPoolsConfig for AntMinerV202307 {
     }
 
     async fn set_pools_config(&self, config: Vec<PoolGroupConfig>) -> anyhow::Result<bool> {
-        let mut pools: Vec<Value> = config
-            .into_iter()
-            .flat_map(|group| group.pools.into_iter())
-            .map(|pool| {
-                json!({
-                    "url": pool.url.to_string(),
-                    "user": pool.username,
-                    "pass": pool.password,
-                })
-            })
-            .collect();
+        let pools = pools_payload(config)?;
+        let conf = self.web.get_miner_conf().await?;
+        if !conf.is_object() {
+            anyhow::bail!("stock miner config is not a JSON object");
+        }
 
-        pools.truncate(3);
-
-        Ok(self
+        let response = self
             .web
-            .set_miner_conf(json!({ "pools": pools }))
-            .await
-            .is_ok())
+            .set_miner_conf(miner_conf_with_pools(&conf, pools.clone()))
+            .await?;
+        if response.get("code").and_then(Value::as_str) == Some("M000") {
+            return Ok(true);
+        }
+
+        // The S21Plus cminer proxy rejects the browser-shaped payload with
+        // M001. Retry its own read-side shape, changing only the pool list.
+        let read_shape = miner_conf_with_read_shape_pools(&conf, pools)
+            .expect("stock miner config was checked to be a JSON object");
+        let response = self.web.set_miner_conf(read_shape).await?;
+        if response.get("code").and_then(Value::as_str) == Some("M000") {
+            return Ok(true);
+        }
+        let code = response
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        anyhow::bail!("stock miner rejected pool configuration (CGI code {code})")
     }
 
     fn supports_pools_config(&self) -> bool {
@@ -995,7 +1381,8 @@ impl Restart for AntMinerV202307 {
         true
     }
     async fn restart(&self) -> anyhow::Result<bool> {
-        Ok(self.web.reboot().await.is_ok())
+        self.web.reboot().await?;
+        Ok(true)
     }
 }
 
@@ -1006,17 +1393,7 @@ impl Pause for AntMinerV202307 {
     }
     #[allow(unused_variables)]
     async fn pause(&self, at_time: Option<Duration>) -> anyhow::Result<bool> {
-        let pre = self.web.get_miner_conf().await?;
-        let Some(miner_conf) = miner_conf_with_miner_mode(&pre, MinerMode::Sleep) else {
-            return Ok(false);
-        };
-
-        let response = self.web.set_miner_conf(miner_conf).await?;
-        if response.get("stats").and_then(Value::as_str) != Some("success") {
-            return Ok(false);
-        }
-
-        Ok(true)
+        self.set_miner_mode(MinerMode::Sleep).await
     }
 }
 
@@ -1027,20 +1404,7 @@ impl Resume for AntMinerV202307 {
     }
     #[allow(unused_variables)]
     async fn resume(&self, at_time: Option<Duration>) -> anyhow::Result<bool> {
-        let pre = self.web.get_miner_conf().await?;
-        let Some(miner_conf) = miner_conf_with_miner_mode(&pre, MinerMode::Normal) else {
-            return Ok(false);
-        };
-
-        let response = self.web.set_miner_conf(miner_conf).await?;
-        if response.get("stats").and_then(Value::as_str) != Some("success") {
-            return Ok(false);
-        }
-
-        // set_miner_conf.cgi writes the config before starting a miner
-        // reload/restart in the background; an immediate follow-up read can
-        // race the device becoming temporarily unavailable.
-        Ok(true)
+        self.set_miner_mode(MinerMode::Normal).await
     }
 }
 
@@ -1101,6 +1465,10 @@ impl FactoryReset for AntMinerV202307 {
     }
 }
 
+impl RestartMining for AntMinerV202307 {}
+
+impl RestoreStockOs for AntMinerV202307 {}
+
 #[async_trait]
 impl SupportsScalingConfig for AntMinerV202307 {
     fn supports_scaling_config(&self) -> bool {
@@ -1110,9 +1478,17 @@ impl SupportsScalingConfig for AntMinerV202307 {
 
 #[async_trait]
 impl UpgradeFirmware for AntMinerV202307 {
-    async fn upgrade_firmware(&self, image: FirmwareImage) -> anyhow::Result<bool> {
+    async fn prepare_firmware(&self, image: FirmwareImage) -> anyhow::Result<FirmwareImage> {
         let miner = self.get_miner_type_info().await?;
-        let image = resolve_firmware_image(image, &miner).await?;
+        resolve_firmware_image(image, &miner).await
+    }
+
+    fn supports_prepare_firmware(&self) -> bool {
+        true
+    }
+
+    async fn upgrade_firmware(&self, image: FirmwareImage) -> anyhow::Result<bool> {
+        let image = self.prepare_firmware(image).await?;
         self.web.upgrade_firmware(image).await?;
         Ok(true)
     }
@@ -1150,20 +1526,41 @@ impl SupportsTuningConfig for AntMinerV202307 {
         _scaling_config: Option<asic_rs_core::config::scaling::ScalingConfig>,
     ) -> anyhow::Result<bool> {
         let mode = match config.target {
+            TuningTarget::Manual { .. } => {
+                anyhow::bail!(
+                    "Manual tuning target is not supported on {} firmware",
+                    AntMinerStockFirmware::default()
+                )
+            }
             TuningTarget::MiningMode(MiningMode::Low) => MinerMode::Low,
             TuningTarget::MiningMode(MiningMode::Normal) => MinerMode::Normal,
             TuningTarget::MiningMode(MiningMode::High) => MinerMode::High,
             TuningTarget::Power(_) => {
-                anyhow::bail!("Power tuning target is not supported on Antminer stock firmware")
+                anyhow::bail!(
+                    "Power tuning target is not supported on {} firmware",
+                    AntMinerStockFirmware::default()
+                )
             }
             TuningTarget::HashRate(_) => {
-                anyhow::bail!("Hashrate tuning target is not supported on Antminer stock firmware")
+                anyhow::bail!(
+                    "Hashrate tuning target is not supported on {} firmware",
+                    AntMinerStockFirmware::default()
+                )
+            }
+            TuningTarget::Preset(_) => {
+                anyhow::bail!(
+                    "Preset tuning target is not supported on {} firmware",
+                    AntMinerStockFirmware::default()
+                )
             }
         };
 
         let pre = self.web.get_miner_conf().await?;
         if miner_mode_config_key(&pre).is_none() {
-            anyhow::bail!("No Antminer mining mode field found in miner config")
+            anyhow::bail!(
+                "No {} mining mode field found in miner config",
+                AntMinerStockFirmware::default()
+            )
         };
 
         self.web
@@ -1182,7 +1579,12 @@ impl SupportsTuningConfig for AntMinerV202307 {
         data.get(&ConfigField::Tuning)
             .and_then(miner_conf_mining_mode)
             .map(|mode| TuningConfig::new(TuningTarget::MiningMode(mode)))
-            .ok_or_else(|| anyhow::anyhow!("No Antminer mining mode found in tuning config"))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No {} mining mode found in tuning config",
+                    AntMinerStockFirmware::default()
+                )
+            })
     }
 
     fn supports_tuning_config(&self) -> bool {
@@ -1233,20 +1635,182 @@ impl SupportsFanConfig for AntMinerV202307 {
 
 impl SupportsTemperatureConfig for AntMinerV202307 {}
 impl GetTuningPercent for AntMinerV202307 {}
+impl SetHashboardsEnabled for AntMinerV202307 {}
+
 impl SetTuningPercent for AntMinerV202307 {}
+
+impl SupportsPresets for AntMinerV202307 {}
 
 #[cfg(test)]
 mod tests {
+    use asic_rs_core::data::device::HashAlgorithm;
     use std::sync::Arc;
 
     use anyhow::{self, Context};
     use asic_rs_core::test::{api::MockAPIClient, util::get_miner};
-    use asic_rs_makes_antminer::models::AntMinerModel;
 
     use super::*;
     use crate::test::json::v2020::{
         AM_DEVS, AM_POOLS, AM_STATS, AM_SUMMARY, AM_SYSTEM_INFO, AM_VERSION,
     };
+    use crate::test::json::v2023_07::{L9_STATS, L9_SUMMARY, L11_STATS, L11_SUMMARY};
+
+    /// Answer one HTTP request with `response` and hand back what was asked.
+    async fn mock_reboot_server(
+        response: &'static str,
+    ) -> anyhow::Result<(u16, tokio::task::JoinHandle<anyhow::Result<String>>)> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .context("timed out waiting for HTTP request")??;
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let bytes_read = socket.read(&mut chunk).await?;
+                if bytes_read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..bytes_read]);
+            }
+            socket.write_all(response.as_bytes()).await?;
+            Ok(String::from_utf8(request)?)
+        });
+
+        Ok((port, task))
+    }
+
+    #[tokio::test]
+    async fn restart_sends_get_and_accepts_a_response_that_is_not_json() -> anyhow::Result<()> {
+        let (port, task) =
+            mock_reboot_server("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await?;
+        let miner = miner_with_mock_web(port);
+
+        assert!(miner.restart().await?);
+
+        let request = task.await??;
+        assert!(request.starts_with("GET /cgi-bin/reboot.cgi HTTP/1.1\r\n"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_reports_why_the_firmware_refused() -> anyhow::Result<()> {
+        let (port, task) = mock_reboot_server(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 13\r\nConnection: close\r\n\r\nreboot failed",
+        )
+        .await?;
+        let miner = miner_with_mock_web(port);
+
+        let error = miner.restart().await.unwrap_err().to_string();
+
+        task.await??;
+        assert!(error.contains("500"), "{error}");
+        assert!(error.contains("reboot failed"), "{error}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_reports_an_unreachable_miner() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let miner = miner_with_mock_web(port);
+
+        let error = miner.restart().await.unwrap_err();
+
+        assert!(format!("{error:#}").contains("reboot request failed"));
+    }
+
+    #[test]
+    fn pools_payload_blanks_the_slots_a_shorter_config_leaves_unused() {
+        let pool = |n: u8| PoolConfig {
+            url: PoolURL::from(format!("stratum+tcp://pool{n}.example:3333")),
+            username: format!("worker.{n}"),
+            password: "x".to_string(),
+        };
+
+        assert_eq!(
+            pools_payload(vec![PoolGroupConfig {
+                name: String::new(),
+                quota: 1,
+                pools: vec![pool(1), pool(2)],
+            }])
+            .unwrap(),
+            vec![
+                json!({"url": "pool1.example:3333", "user": "worker.1", "pass": "x"}),
+                json!({"url": "pool2.example:3333", "user": "worker.2", "pass": "x"}),
+                json!({"url": "", "user": "", "pass": ""}),
+            ]
+        );
+    }
+
+    #[test]
+    fn pools_payload_rejects_schemes_the_stock_cgi_cannot_represent() {
+        let pool = PoolConfig {
+            url: PoolURL::from("stratum+ssl://pool.example:3333".to_string()),
+            username: "worker".to_string(),
+            password: "x".to_string(),
+        };
+        let config = vec![PoolGroupConfig {
+            name: String::new(),
+            quota: 1,
+            pools: vec![pool],
+        }];
+
+        assert!(pools_payload(config).is_err());
+    }
+
+    #[test]
+    fn pool_update_normalizes_read_config_for_cgi_write() {
+        let read_config = json!({
+            "pools": [{"url": "old.example:3333", "user": "old", "pass": "x"}],
+            "bitmain-fan-ctrl": true,
+            "bitmain-fan-pwm": "70",
+            "bitmain-work-mode": "2",
+            "bitmain-freq-level": "85",
+            "api-listen": true
+        });
+        let pools = vec![json!({"url": "new.example:3333", "user": "new", "pass": "x"})];
+
+        assert_eq!(
+            miner_conf_with_pools(&read_config, pools),
+            json!({
+                "pools": [{"url": "new.example:3333", "user": "new", "pass": "x"}],
+                "bitmain-fan-ctrl": true,
+                "bitmain-fan-pwm": "70",
+                "bitmain-work-mode": "2",
+                "freq-level": "85"
+            })
+        );
+    }
+
+    #[test]
+    fn pool_update_can_preserve_read_shape_for_s21plus_cminer() {
+        let read_config = json!({
+            "pools": [{"url": "old.example:3333", "user": "old", "pass": "x"}],
+            "bitmain-fan-ctrl": false,
+            "bitmain-fan-pwm": 100,
+            "bitmain-freq": "550",
+            "bitmain-freq-level": 100,
+            "bitmain-user-ip-cat": "",
+            "bitmain-voltage": "1400",
+            "bitmain-work-mode": 0
+        });
+        let pools = vec![json!({"url": "new.example:3333", "user": "new", "pass": "x"})];
+        let mut expected = read_config.clone();
+        expected["pools"] = Value::Array(pools.clone());
+
+        assert_eq!(
+            miner_conf_with_read_shape_pools(&read_config, pools),
+            Some(expected)
+        );
+    }
 
     #[test]
     fn set_miner_conf_payload_matches_cgi_contract_for_pause_resume() {
@@ -1282,6 +1846,336 @@ mod tests {
         assert_eq!(
             miner_conf_with_miner_mode(&pre, MinerMode::Normal).unwrap()["miner-mode"],
             json!(0)
+        );
+    }
+
+    #[test]
+    fn read_shape_mode_payload_preserves_s21plus_config_fields() {
+        let pre = json!({
+            "pools": [{"url": "pool.example:3333", "user": "worker", "pass": "x"}],
+            "bitmain-fan-ctrl": false,
+            "bitmain-fan-pwm": 100,
+            "bitmain-freq": "550",
+            "bitmain-freq-level": 100,
+            "bitmain-user-ip-cat": "",
+            "bitmain-voltage": "1400",
+            "bitmain-work-mode": 0
+        });
+        let mut expected = pre.clone();
+        expected["bitmain-work-mode"] = json!(1);
+
+        assert_eq!(
+            miner_conf_with_read_shape_mode(&pre, MinerMode::Sleep),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn cgi_failure_code_overrides_success_stats() {
+        assert!(!miner_conf_write_accepted(&json!({
+            "stats": "success", "code": "M001", "msg": "FAIL!"
+        })));
+        assert!(miner_conf_write_accepted(&json!({
+            "stats": "success", "code": "M000", "msg": "OK!"
+        })));
+    }
+
+    #[test]
+    fn sleep_confirmation_accepts_both_stopped_modes() {
+        for mode in [json!(1), json!("1"), json!(5), json!("5")] {
+            assert!(miner_conf_has_mode(
+                &json!({"bitmain-work-mode": mode}),
+                MinerMode::Sleep
+            ));
+        }
+        assert!(!miner_conf_has_mode(
+            &json!({"bitmain-work-mode": 0}),
+            MinerMode::Sleep
+        ));
+    }
+
+    #[test]
+    fn ks5_current_hashrate_keeps_units_and_zero() {
+        for model in [AntMinerModel::KS5, AntMinerModel::KS5Pro] {
+            let miner = AntMinerV202307::new(IpAddr::from([127, 0, 0, 1]), model);
+            // Synthetic CGI aggregates, with deliberately stale averages.
+            for (stats, expected) in [
+                (
+                    json!({"rate_5s": 21083.13, "rate_unit": "GH/s", "rate_avg": 77000}),
+                    21.08313,
+                ),
+                (
+                    json!({"rate_5s": "21.08313", "rate_unit": "TH/s"}),
+                    21.08313,
+                ),
+                (
+                    json!({"rate_5s": 0, "rate_unit": "MH/s", "rate_avg": 77000}),
+                    0.0,
+                ),
+                (
+                    json!({"GHS 5s": 21083.13, "MHS 5s": 21083130, "GHS av": 77000}),
+                    21.08313,
+                ),
+                (
+                    json!({"rate_5s": 21083.13, "rate_unit": "GH/s", "THS 5s": 21.08313}),
+                    21.08313,
+                ),
+            ] {
+                let data = HashMap::from([(DataField::Hashrate, json!({"stats": [stats]}))]);
+                let rate = miner.parse_hashrate(&data).unwrap();
+                assert_eq!(rate.unit, HashRateUnit::TeraHash);
+                assert_eq!(rate.algo, HashAlgorithm::KHeavyHash);
+                assert!((rate.value - expected).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn ks5_missing_invalid_or_conflicting_current_rates_stay_unknown() {
+        let miner = AntMinerV202307::new(IpAddr::from([127, 0, 0, 1]), AntMinerModel::KS5Pro);
+        for stats in [
+            json!({"rate_avg": 77000, "rate_unit": "GH/s"}),
+            json!({"GHS av": 77000}),
+            json!({"chain": [{"rate_5s": 21000}], "rate_unit": "GH/s"}),
+            json!({"series": [{"name": "chain0", "data": [21000]}], "unit": "GH/s"}),
+            json!({"rate_5s": 21000}),
+            json!({"rate_5s": 21000, "rate_unit": "unknown"}),
+            json!({"rate_5s": 21000, "rate_unit": "Sol/s"}),
+            json!({"rate_5s": 0, "rate_unit": "GH/s", "GHS 5s": 21000}),
+            json!({"rate_5s": 0, "rate_unit": "GH/s", "GHS 5s": 0.0001}),
+            json!({"GHS 5s": 21000, "THS 5s": 22}),
+            json!({"rate_5s": 21, "rate_unit": "TH/s", "GHS 5s": 21000.015, "MHS 5s": 21000030}),
+        ] {
+            let data = HashMap::from([(DataField::Hashrate, json!({"stats": [stats]}))]);
+            assert!(miner.parse_hashrate(&data).is_none(), "{data:?}");
+        }
+        for invalid in [
+            json!(null),
+            json!(true),
+            json!(-1),
+            json!("broken"),
+            json!("NaN"),
+            json!("inf"),
+            json!("1e999"),
+        ] {
+            for stats in [
+                json!({"rate_5s": invalid, "rate_unit": "GH/s", "rate_avg": 77000, "GHS 5s": 21000}),
+                json!({"rate_5s": 21000, "rate_unit": "GH/s", "GHS 5s": invalid}),
+            ] {
+                let data = HashMap::from([(DataField::Hashrate, json!({"stats": [stats]}))]);
+                assert!(miner.parse_hashrate(&data).is_none(), "{data:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ks5_keeps_rpc_current_rate_and_falls_back_to_one_cgi_aggregate() {
+        for model in [AntMinerModel::KS5, AntMinerModel::KS5Pro] {
+            let miner = AntMinerV202307::new(IpAddr::from([127, 0, 0, 1]), model);
+            for (summary, stats, expected) in [
+                (
+                    json!([{"GHS 5s": 0, "GHS av": 77000}]),
+                    Some(json!([{"rate_5s": 21000, "rate_unit": "GH/s"}])),
+                    Some(0.0),
+                ),
+                (json!([{"GHS 5s": 21000}]), None, Some(21.0)),
+                (
+                    json!([{"GHS av": 77000}]),
+                    Some(json!([{"rate_5s": 0, "rate_unit": "GH/s", "rate_avg": 77000}])),
+                    Some(0.0),
+                ),
+                (
+                    json!([{"series": [{"name": "chain0", "data": [21000]}]}]),
+                    Some(json!([{"rate_5s": 21000, "rate_unit": "GH/s"}])),
+                    Some(21.0),
+                ),
+                (
+                    json!([{"GHS 5s": true, "GHS av": 77000}]),
+                    Some(json!([{"rate_5s": 21000, "rate_unit": "GH/s"}])),
+                    Some(21.0),
+                ),
+                (json!([{"GHS av": 77000}]), None, None),
+                (json!([{"GHS av": 77000}]), Some(json!([])), None),
+                (json!([{"GHS 5s": 0}, {"GHS 5s": 21000}]), None, None),
+                (
+                    json!([{"GHS av": 77000}]),
+                    Some(
+                        json!([{"rate_5s": 0, "rate_unit": "GH/s"}, {"rate_5s": 21000, "rate_unit": "GH/s"}]),
+                    ),
+                    None,
+                ),
+                (
+                    json!([{"GHS av": 77000}]),
+                    Some(json!([{"rate_avg": 77000, "rate_unit": "GH/s"}])),
+                    None,
+                ),
+            ] {
+                let mut results = HashMap::from([(
+                    MinerCommand::RPC {
+                        command: "summary",
+                        parameters: None,
+                    },
+                    json!({"SUMMARY": summary}),
+                )]);
+                if let Some(stats) = stats {
+                    results.insert(
+                        MinerCommand::WebAPI {
+                            command: "stats",
+                            parameters: None,
+                        },
+                        json!({"STATS": stats}),
+                    );
+                }
+                let mock_api = MockAPIClient::new(results);
+                let mut collector = DataCollector::new_with_client(&miner, &mock_api);
+                let data = collector.collect(&[DataField::Hashrate]).await;
+                let rate = miner.parse_hashrate(&data);
+                assert_eq!(rate.map(|rate| rate.value), expected, "{data:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn z15_pro_uses_displayed_ksol_unit() {
+        let miner = AntMinerV202307::new(IpAddr::from([127, 0, 0, 1]), AntMinerModel::Z15Pro);
+        let data = HashMap::from([
+            (
+                DataField::Hashrate,
+                json!({
+                    "GHS 5s": 838.86,
+                    "RT HASHRATE": "838.86 Ksol/s",
+                    "AV HASHRATE": "841.92 Ksol/s"
+                }),
+            ),
+            (DataField::ExpectedHashrate, json!({"hashrate": 846.8})),
+        ]);
+
+        let actual = miner.parse_hashrate(&data).unwrap();
+        assert_eq!(actual.unit, HashAlgorithm::Equihash.default_hashrate_unit());
+        assert_eq!(actual.value, 838.86);
+
+        let expected = miner.parse_expected_hashrate(&data).unwrap();
+        assert_eq!(
+            expected.unit,
+            HashAlgorithm::Equihash.default_hashrate_unit()
+        );
+        assert_eq!(expected.value, 846.8);
+    }
+
+    #[tokio::test]
+    async fn z15_pro_standalone_board_and_expected_rates_use_display_unit() {
+        let miner = AntMinerV202307::new(IpAddr::from([127, 0, 0, 1]), AntMinerModel::Z15Pro);
+        let results = HashMap::from([
+            (
+                MinerCommand::RPC {
+                    command: "summary",
+                    parameters: None,
+                },
+                json!({"SUMMARY": [{"GHS 5s": 838.86, "RT HASHRATE": "838.86 Ksol/s", "AV HASHRATE": "841.92 Ksol/s"}]}),
+            ),
+            (
+                MinerCommand::RPC {
+                    command: "stats",
+                    parameters: None,
+                },
+                json!({"STATS": [{}, {"rate_unit": "GH", "total_rateideal": 846.8, "chain_rate1": 280.0}]}),
+            ),
+        ]);
+        let mock_api = MockAPIClient::new(results);
+        let mut collector = DataCollector::new_with_client(&miner, &mock_api);
+
+        let expected_data = collector.collect(&[DataField::ExpectedHashrate]).await;
+        let expected = miner.parse_expected_hashrate(&expected_data).unwrap();
+        assert_eq!(
+            expected.unit,
+            HashAlgorithm::Equihash.default_hashrate_unit()
+        );
+        assert_eq!(expected.value, 846.8);
+
+        let board_data = collector.collect(&[DataField::Hashboards]).await;
+        let board = miner.parse_hashboards(&board_data).remove(0);
+        let rate = board.hashrate.unwrap();
+        assert_eq!(rate.unit, HashAlgorithm::Equihash.default_hashrate_unit());
+        assert_eq!(rate.value, 280.0);
+    }
+
+    /// Captured from live L9 and L11 hardware on stock firmware. Both are
+    /// Scrypt, both report in GH/s, and neither emits STATS' `rate_unit` --
+    /// only the S21 fixture does -- so the GH/s fallback carries these models.
+    #[tokio::test]
+    async fn scrypt_models_from_live_hardware() {
+        for (model, summary, stats, hashrate, expected, board0, chips) in [
+            (
+                AntMinerModel::L9,
+                L9_SUMMARY,
+                L9_STATS,
+                11.48,
+                17.03,
+                5.659831296,
+                [110u16, 110, 25],
+            ),
+            (
+                AntMinerModel::L11,
+                L11_SUMMARY,
+                L11_STATS,
+                19.21,
+                20.52,
+                6.80496896,
+                [88, 88, 88],
+            ),
+        ] {
+            let miner = AntMinerV202307::new(IpAddr::from([127, 0, 0, 1]), model.clone());
+
+            let mut results = HashMap::new();
+            results.insert(
+                MinerCommand::RPC {
+                    command: "summary",
+                    parameters: None,
+                },
+                Value::from_str(summary).unwrap(),
+            );
+            results.insert(
+                MinerCommand::RPC {
+                    command: "stats",
+                    parameters: None,
+                },
+                Value::from_str(stats).unwrap(),
+            );
+
+            let mock_api = MockAPIClient::new(results);
+            let mut collector = DataCollector::new_with_client(&miner, &mock_api);
+            let miner_data = miner.parse_data(collector.collect_all().await);
+
+            let hr = miner_data.hashrate.clone().expect("hashrate");
+            assert_eq!(hr.algo, HashAlgorithm::Scrypt, "{model}");
+            assert_eq!(hr.unit, HashRateUnit::GigaHash, "{model}");
+            assert_giga_hash(hr, hashrate, model.to_string());
+
+            let ex = miner_data.expected_hashrate.clone().expect("expected");
+            assert_eq!(ex.algo, HashAlgorithm::Scrypt, "{model}");
+            assert_eq!(ex.unit, HashRateUnit::GigaHash, "{model}");
+            assert_giga_hash(ex, expected, model.to_string());
+
+            let b0 = miner_data.hashboards[0].hashrate.clone().expect("board 0");
+            assert_eq!(b0.algo, HashAlgorithm::Scrypt, "{model}");
+            assert_eq!(b0.unit, HashRateUnit::GigaHash, "{model}");
+            assert_giga_hash(b0, board0, model.to_string());
+
+            let working: Vec<u16> = miner_data
+                .hashboards
+                .iter()
+                .filter_map(|b| b.working_chips)
+                .collect();
+            assert_eq!(working, chips.to_vec(), "{model} working chips");
+        }
+    }
+
+    #[track_caller]
+    fn assert_giga_hash(hashrate: HashRate, expected: f64, label: String) {
+        let value = hashrate.as_unit(HashRateUnit::GigaHash).value;
+        assert!(
+            (value - expected).abs() < 1e-6,
+            "{label}: expected {expected} GH/s, got {value}"
         );
     }
 
@@ -1348,7 +2242,7 @@ mod tests {
             HashRate {
                 value: 110.0,
                 unit: HashRateUnit::TeraHash,
-                algo: "SHA256".to_string(),
+                algo: HashAlgorithm::SHA256,
             }
         );
         assert_eq!(
@@ -1356,7 +2250,7 @@ mod tests {
             HashRate {
                 value: 110.56689,
                 unit: HashRateUnit::TeraHash,
-                algo: "SHA256".to_string(),
+                algo: HashAlgorithm::SHA256,
             }
         );
     }
@@ -1386,6 +2280,112 @@ mod tests {
         assert_eq!(miner_data.ip, ip);
         assert!(miner_data.timestamp > 0);
         assert!(!miner_data.schema_version.is_empty());
+
+        Ok(())
+    }
+
+    struct MockHttpServer {
+        port: u16,
+        task: tokio::task::JoinHandle<anyhow::Result<String>>,
+    }
+
+    /// Answers each request in turn with the next `(status, reason, body)` and
+    /// hands back the last request it saw.
+    async fn mock_http_server(
+        responses: Vec<(u16, &'static str, &'static str)>,
+    ) -> anyhow::Result<MockHttpServer> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let task = tokio::spawn(async move {
+            let mut last_request = String::new();
+            for (status, reason, body) in responses {
+                let (mut socket, _) =
+                    tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                        .await
+                        .context("timed out waiting for HTTP request")??;
+
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                loop {
+                    if let Some(header_end) = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|position| position + 4)
+                    {
+                        let headers = std::str::from_utf8(&request[..header_end])?;
+                        let content_length = headers
+                            .lines()
+                            .filter_map(|line| line.split_once(':'))
+                            .find_map(|(name, value)| {
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or_default();
+                        if request.len() >= header_end + content_length {
+                            break;
+                        }
+                    }
+                    let bytes_read = socket.read(&mut chunk).await?;
+                    if bytes_read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..bytes_read]);
+                }
+                last_request = String::from_utf8(request)?;
+
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await?;
+            }
+            Ok(last_request)
+        });
+
+        Ok(MockHttpServer { port, task })
+    }
+
+    fn miner_with_mock_web(port: u16) -> AntMinerV202307 {
+        let ip = IpAddr::from([127, 0, 0, 1]);
+        let mut miner = AntMinerV202307::new(ip, AntMinerModel::S19);
+        miner.web = AntMinerWebAPI::new_with_port(ip, port, MinerAuth::new("root", "root"));
+        miner
+    }
+
+    #[tokio::test]
+    async fn set_fault_light_reports_why_the_miner_refused() -> anyhow::Result<()> {
+        let MockHttpServer { port, task } = mock_http_server(vec![(
+            500,
+            "Internal Server Error",
+            "blink.cgi: cannot reach bmminer",
+        )])
+        .await?;
+        let miner = miner_with_mock_web(port);
+
+        let error = miner.set_fault_light(true).await.unwrap_err();
+
+        let request = task.await??;
+        assert!(request.starts_with("POST /cgi-bin/blink.cgi HTTP/1.1\r\n"));
+        let error = error.to_string();
+        assert!(error.contains("500"), "{error}");
+        assert!(error.contains("blink.cgi: cannot reach bmminer"), "{error}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_fault_light_still_returns_true_when_accepted() -> anyhow::Result<()> {
+        let MockHttpServer { port, task } =
+            mock_http_server(vec![(200, "OK", r#"{"code":"B000"}"#)]).await?;
+        let miner = miner_with_mock_web(port);
+
+        assert!(miner.set_fault_light(true).await?);
+
+        let request = task.await??;
+        assert!(request.starts_with("POST /cgi-bin/blink.cgi HTTP/1.1\r\n"));
 
         Ok(())
     }

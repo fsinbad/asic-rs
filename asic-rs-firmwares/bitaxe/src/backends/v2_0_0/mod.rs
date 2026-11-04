@@ -17,7 +17,9 @@ use asic_rs_core::{
         fan::FanData,
         hashrate::{HashRate, HashRateUnit},
         message::{MessageSeverity, MinerMessage},
+        operating_state::OperatingState,
         pool::{PoolData, PoolGroupData, PoolScheme, PoolURL},
+        share::parse_share_difficulty,
     },
     traits::{miner::*, model::MinerModel},
     util::unix_timestamp_secs,
@@ -56,7 +58,10 @@ impl APIClient for Bitaxe200 {
     async fn get_api_result(&self, command: &MinerCommand) -> anyhow::Result<Value> {
         match command {
             MinerCommand::WebAPI { .. } => self.web.get_api_result(command).await,
-            _ => Err(anyhow::anyhow!("Unsupported command type for Bitaxe API")),
+            _ => Err(anyhow::anyhow!(
+                "Unsupported command type for {} API",
+                BitaxeFirmware::default()
+            )),
         }
     }
 }
@@ -83,6 +88,14 @@ impl GetDataLocations for Bitaxe200 {
         };
 
         match data_field {
+            DataField::OperatingState => vec![(
+                WEB_SYSTEM_INFO,
+                DataExtractor {
+                    func: get_by_key,
+                    key: Some("miningPaused"),
+                    tag: None,
+                },
+            )],
             DataField::Mac => vec![(
                 WEB_SYSTEM_INFO,
                 DataExtractor {
@@ -195,6 +208,22 @@ impl GetDataLocations for Bitaxe200 {
                     tag: None,
                 },
             )],
+            DataField::BestShare => vec![(
+                WEB_SYSTEM_INFO,
+                DataExtractor {
+                    func: get_by_key,
+                    key: Some("bestDiff"),
+                    tag: None,
+                },
+            )],
+            DataField::SessionBestShare => vec![(
+                WEB_SYSTEM_INFO,
+                DataExtractor {
+                    func: get_by_key,
+                    key: Some("bestSessionDiff"),
+                    tag: None,
+                },
+            )],
             _ => vec![],
         }
     }
@@ -264,9 +293,9 @@ impl GetHashboards for Bitaxe200 {
             HashRate {
                 value: f,
                 unit: HashRateUnit::GigaHash,
-                algo: "SHA256".to_string(),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default())
+            .as_default_unit()
         });
         board.expected_hashrate = api_data
             .get("smallCoreCount")
@@ -277,9 +306,9 @@ impl GetHashboards for Bitaxe200 {
                 HashRate {
                     value: core_count as f64 * chips as f64 * freq.as_gigahertz(),
                     unit: HashRateUnit::GigaHash,
-                    algo: "SHA256".to_string(),
+                    algo: self.device_info.algo,
                 }
-                .as_unit(HashRateUnit::default())
+                .as_default_unit()
             });
         // `vrTemp` is the VR/board sensor; `temp` is the ASIC chip sensor.
         let chip_temp = api_data
@@ -333,9 +362,9 @@ impl GetHashrate for Bitaxe200 {
             HashRate {
                 value: f,
                 unit: HashRateUnit::GigaHash,
-                algo: "SHA256".to_string(),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default())
+            .as_default_unit()
         })
     }
 }
@@ -363,9 +392,9 @@ impl GetExpectedHashrate for Bitaxe200 {
                         .unwrap_or(Frequency::from_megahertz(0f64))
                         .as_gigahertz(),
                 unit: HashRateUnit::GigaHash,
-                algo: "SHA256".to_string(),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default()),
+            .as_default_unit(),
         )
     }
 }
@@ -382,6 +411,7 @@ impl GetFans for Bitaxe200 {
 impl GetPsuFans for Bitaxe200 {
     // N/A
 }
+impl GetPsus for Bitaxe200 {}
 impl GetFluidTemperature for Bitaxe200 {
     // N/A
 }
@@ -425,6 +455,36 @@ impl GetUptime for Bitaxe200 {
         data.extract_map::<u64, _>(DataField::Uptime, Duration::from_secs)
     }
 }
+
+impl GetBestShare for Bitaxe200 {
+    fn parse_best_share(&self, data: &HashMap<DataField, Value>) -> Option<f64> {
+        data.get(&DataField::BestShare)
+            .and_then(parse_share_difficulty)
+    }
+}
+
+impl GetSessionBestShare for Bitaxe200 {
+    fn parse_session_best_share(&self, data: &HashMap<DataField, Value>) -> Option<f64> {
+        data.get(&DataField::SessionBestShare)
+            .and_then(parse_share_difficulty)
+    }
+}
+impl GetOperatingState for Bitaxe200 {
+    fn parse_operating_state(&self, data: &HashMap<DataField, Value>) -> Option<OperatingState> {
+        data.get(&DataField::OperatingState)
+            .and_then(Value::as_bool)
+            .map(|paused| {
+                if paused {
+                    OperatingState::Paused {}
+                } else {
+                    OperatingState::Mining {}
+                }
+            })
+    }
+}
+
+impl GetDevFeeConnected for Bitaxe200 {}
+
 impl GetIsMining for Bitaxe200 {}
 impl GetPools for Bitaxe200 {
     fn parse_pools(&self, data: &HashMap<DataField, Value>) -> Vec<PoolGroupData> {
@@ -450,6 +510,7 @@ impl GetPools for Bitaxe200 {
             url: Some(main_pool_url),
             accepted_shares: accepted_share,
             rejected_shares: rejected_share,
+            last_share_time: None,
             active: Some(!is_using_fallback),
             alive: None,
             user: main_user,
@@ -473,6 +534,7 @@ impl GetPools for Bitaxe200 {
             url: Some(fallback_pool_url),
             accepted_shares: accepted_share,
             rejected_shares: rejected_share,
+            last_share_time: None,
             active: Some(is_using_fallback),
             alive: None,
             user: fallback_user,
@@ -555,6 +617,9 @@ impl FactoryReset for Bitaxe200 {
     }
 }
 
+impl RestartMining for Bitaxe200 {}
+impl RestoreStockOs for Bitaxe200 {}
+
 #[async_trait]
 impl SupportsScalingConfig for Bitaxe200 {
     fn supports_scaling_config(&self) -> bool {
@@ -570,6 +635,7 @@ impl UpgradeFirmware for Bitaxe200 {
 }
 
 impl HasAuth for Bitaxe200 {}
+impl SupportsTimezoneConfig for Bitaxe200 {}
 impl HasDefaultAuth for Bitaxe200 {}
 
 impl Validate for Bitaxe200 {
@@ -596,7 +662,11 @@ impl SupportsFanConfig for Bitaxe200 {
 
 impl SupportsTemperatureConfig for Bitaxe200 {}
 impl GetTuningPercent for Bitaxe200 {}
+impl SetHashboardsEnabled for Bitaxe200 {}
+
 impl SetTuningPercent for Bitaxe200 {}
+
+impl SupportsPresets for Bitaxe200 {}
 
 #[cfg(test)]
 mod tests {
@@ -697,7 +767,7 @@ mod tests {
             &Some(HashRate {
                 value: 1f64,
                 unit: HashRateUnit::TeraHash,
-                algo: "SHA256".to_string(),
+                algo: HashAlgorithm::SHA256,
             })
         );
         assert_eq!(&miner_data.total_chips, &Some(1u16));
@@ -711,6 +781,8 @@ mod tests {
         assert_eq!(
             &miner_data.wattage,
             &Some(Power::from_watts(2.65000009536743))
-        )
+        );
+        assert_eq!(miner_data.best_share, Some(483_000.0));
+        assert_eq!(miner_data.session_best_share, Some(0.0));
     }
 }

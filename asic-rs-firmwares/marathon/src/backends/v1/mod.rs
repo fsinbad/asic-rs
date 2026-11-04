@@ -17,6 +17,7 @@ use asic_rs_core::{
         hashrate::{HashRate, HashRateUnit},
         message::{MessageSeverity, MinerMessage},
         miner::TuningTarget,
+        operating_state::OperatingState,
         pool::{PoolData, PoolGroupData, PoolURL},
     },
     traits::{miner::*, model::MinerModel},
@@ -371,7 +372,10 @@ impl APIClient for MaraV1 {
     async fn get_api_result(&self, command: &MinerCommand) -> anyhow::Result<Value> {
         match command {
             MinerCommand::WebAPI { .. } => self.web.get_api_result(command).await,
-            _ => Err(anyhow::anyhow!("Unsupported command type for Marathon API")),
+            _ => Err(anyhow::anyhow!(
+                "Unsupported command type for {} API",
+                MarathonFirmware::default()
+            )),
         }
     }
 }
@@ -561,6 +565,14 @@ impl GetDataLocations for MaraV1 {
                     tag: None,
                 },
             )],
+            DataField::OperatingState => vec![(
+                WEB_BRIEF,
+                DataExtractor {
+                    func: get_by_pointer,
+                    key: Some("/status"),
+                    tag: None,
+                },
+            )],
             DataField::Uptime => vec![(
                 WEB_BRIEF,
                 DataExtractor {
@@ -616,6 +628,7 @@ impl GetMAC for MaraV1 {
 }
 
 impl GetSerialNumber for MaraV1 {}
+impl SupportsTimezoneConfig for MaraV1 {}
 
 impl GetHostname for MaraV1 {
     fn parse_hostname(&self, data: &HashMap<DataField, Value>) -> Option<String> {
@@ -651,7 +664,7 @@ impl GetControlBoardVersion for MaraV1 {
 }
 
 impl MaraV1 {
-    fn parse_chip_data(asic_infos: &Value) -> Vec<ChipData> {
+    fn parse_chip_data(&self, asic_infos: &Value) -> Vec<ChipData> {
         asic_infos
             .as_array()
             .map(|chips| {
@@ -667,9 +680,9 @@ impl MaraV1 {
                                     HashRate {
                                         value,
                                         unit: HashRateUnit::GigaHash,
-                                        algo: "SHA256".to_string(),
+                                        algo: self.device_info.algo,
                                     }
-                                    .as_unit(HashRateUnit::default())
+                                    .as_default_unit()
                                 });
 
                         let voltage = chip
@@ -741,17 +754,17 @@ impl GetHashboards for MaraV1 {
                 HashRate {
                     value: f,
                     unit: HashRateUnit::GigaHash,
-                    algo: "SHA256".to_string(),
+                    algo: self.device_info.algo,
                 }
-                .as_unit(HashRateUnit::default())
+                .as_default_unit()
             });
             board.expected_hashrate = hb.get("hashrate_ideal").and_then(|v| v.as_f64()).map(|f| {
                 HashRate {
                     value: f,
                     unit: HashRateUnit::GigaHash,
-                    algo: "SHA256".to_string(),
+                    algo: self.device_info.algo,
                 }
-                .as_unit(HashRateUnit::default())
+                .as_default_unit()
             });
 
             if let Some(temps_obj) = temps_obj {
@@ -789,7 +802,7 @@ impl GetHashboards for MaraV1 {
             }) {
                 board.chips = chip_hb
                     .get("asic_infos")
-                    .map(Self::parse_chip_data)
+                    .map(|asic_infos| self.parse_chip_data(asic_infos))
                     .unwrap_or_default();
             }
             board.voltage = hb
@@ -813,9 +826,9 @@ impl GetHashrate for MaraV1 {
             HashRate {
                 value: rate,
                 unit: HashRateUnit::GigaHash,
-                algo: "SHA256".to_string(),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default())
+            .as_default_unit()
         })
     }
 }
@@ -826,9 +839,9 @@ impl GetExpectedHashrate for MaraV1 {
             HashRate {
                 value: rate,
                 unit: HashRateUnit::GigaHash,
-                algo: "SHA256".to_string(),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default())
+            .as_default_unit()
         })
     }
 }
@@ -866,6 +879,7 @@ impl GetFans for MaraV1 {
 }
 
 impl GetPsuFans for MaraV1 {}
+impl GetPsus for MaraV1 {}
 
 impl GetFluidTemperature for MaraV1 {}
 
@@ -939,6 +953,19 @@ impl GetUptime for MaraV1 {
     }
 }
 
+impl GetBestShare for MaraV1 {}
+impl GetSessionBestShare for MaraV1 {}
+
+impl GetOperatingState for MaraV1 {
+    fn parse_operating_state(&self, data: &HashMap<DataField, Value>) -> Option<OperatingState> {
+        data.get(&DataField::OperatingState)
+            .and_then(Value::as_str)
+            .and_then(OperatingState::from_label)
+    }
+}
+
+impl GetDevFeeConnected for MaraV1 {}
+
 impl GetIsMining for MaraV1 {
     fn parse_is_mining(&self, data: &HashMap<DataField, Value>) -> bool {
         data.extract::<String>(DataField::IsMining)
@@ -998,6 +1025,7 @@ impl GetPools for MaraV1 {
                     url,
                     accepted_shares: accepted,
                     rejected_shares: rejected,
+                    last_share_time: None,
                     active: Some(active),
                     alive,
                     user,
@@ -1119,6 +1147,9 @@ impl FactoryReset for MaraV1 {
     }
 }
 
+impl RestartMining for MaraV1 {}
+impl RestoreStockOs for MaraV1 {}
+
 #[async_trait]
 impl SupportsScalingConfig for MaraV1 {
     fn supports_scaling_config(&self) -> bool {
@@ -1165,11 +1196,48 @@ impl SupportsFanConfig for MaraV1 {
 
 impl SupportsTemperatureConfig for MaraV1 {}
 impl GetTuningPercent for MaraV1 {}
+impl SetHashboardsEnabled for MaraV1 {}
+
 impl SetTuningPercent for MaraV1 {}
+
+impl SupportsPresets for MaraV1 {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn operating_state_uses_the_brief_response() {
+        use asic_rs_core::{data::operating_state::OperatingState, test::api::MockAPIClient};
+        use asic_rs_makes_antminer::models::AntMinerModel;
+
+        let miner = MaraV1::new(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S19XP);
+        for (label, expected) in [
+            ("Mining", OperatingState::Mining {}),
+            ("Idling", OperatingState::Idling {}),
+            (
+                "FutureMaraState",
+                OperatingState::Unknown {
+                    raw: "FutureMaraState".into(),
+                },
+            ),
+        ] {
+            let client = MockAPIClient::new(HashMap::from([(
+                MinerCommand::WebAPI {
+                    command: "brief",
+                    parameters: None,
+                },
+                json!({ "status": label }),
+            )]));
+            let mut collector = DataCollector::new_with_client(&miner, &client);
+            let data = collector
+                .collect(&[DataField::OperatingState, DataField::IsMining])
+                .await;
+            let snapshot = miner.parse_data(data);
+            assert_eq!(snapshot.operating_state, Some(expected));
+            assert_eq!(snapshot.is_mining, label == "Mining");
+        }
+    }
 
     #[test]
     fn test_build_pool_config_allows_empty_groups() -> anyhow::Result<()> {

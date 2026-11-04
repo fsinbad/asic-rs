@@ -1,7 +1,7 @@
 use std::{fmt::Display, net::IpAddr};
 
 use asic_rs_core::{
-    data::command::MinerCommand,
+    data::command::DiscoveryCommand,
     discovery::HTTP_WEB_ROOT,
     errors::ModelSelectionError,
     traits::{
@@ -11,7 +11,6 @@ use asic_rs_core::{
         identification::{FirmwareIdentification, WebResponse},
         make::MinerMake,
         miner::{Miner, MinerAuth, MinerConstructor},
-        model::MinerModel,
     },
     util,
 };
@@ -28,14 +27,16 @@ impl Display for BitaxeFirmware {
 }
 
 impl DiscoveryCommands for BitaxeFirmware {
-    fn get_discovery_commands(&self) -> Vec<MinerCommand> {
+    fn get_discovery_commands(&self) -> Vec<DiscoveryCommand> {
         vec![HTTP_WEB_ROOT]
     }
 }
 
 #[async_trait]
 impl MinerFirmware for BitaxeFirmware {
-    async fn get_model(ip: IpAddr) -> Result<impl MinerModel + Send, ModelSelectionError> {
+    type Model = asic_rs_makes_bitaxe::models::BitaxeModel;
+
+    async fn get_model(ip: IpAddr) -> Result<Self::Model, ModelSelectionError> {
         let response = util::send_web_command(&ip, "/api/system/info").await;
 
         match response {
@@ -55,8 +56,11 @@ impl MinerFirmware for BitaxeFirmware {
         }
     }
 
-    async fn get_version(_ip: IpAddr) -> Option<semver::Version> {
-        None
+    async fn get_version(ip: IpAddr) -> Option<semver::Version> {
+        let (text, _, _) = util::send_web_command(&ip, "/api/system/info").await?;
+        let json_data: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let version_str = json_data["version"].as_str()?.trim_start_matches('v');
+        semver::Version::parse(version_str).ok()
     }
 }
 

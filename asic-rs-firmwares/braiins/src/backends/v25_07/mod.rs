@@ -3,8 +3,9 @@ use std::{collections::HashMap, net::IpAddr, str::FromStr, time::Duration};
 use anyhow;
 use asic_rs_core::{
     config::{
-        collector::{ConfigCollector, ConfigField, ConfigLocation},
+        collector::{ConfigCollector, ConfigExtractor, ConfigField, ConfigLocation},
         pools::PoolGroupConfig,
+        timezone::{TimezoneConfig, Tz},
     },
     data::{
         board::{BoardData, MinerControlBoard},
@@ -18,6 +19,7 @@ use asic_rs_core::{
         hashrate::{HashRate, HashRateUnit},
         message::{MessageSeverity, MinerMessage},
         miner::TuningTarget,
+        operating_state::OperatingState,
         pool::{PoolData, PoolGroupData, PoolURL},
     },
     traits::{miner::*, model::MinerModel},
@@ -71,15 +73,80 @@ impl APIClient for BraiinsV2507 {
         match command {
             MinerCommand::WebAPI { .. } => self.web.get_api_result(command).await,
             MinerCommand::GraphQL { .. } => self.graphql.get_api_result(command).await,
-            _ => Err(anyhow::anyhow!("Unsupported command type for Braiins API")),
+            _ => Err(anyhow::anyhow!(
+                "Unsupported command type for {} API",
+                BraiinsFirmware::default()
+            )),
         }
+    }
+}
+
+#[async_trait]
+impl SetHashboardsEnabled for BraiinsV2507 {
+    async fn set_hashboards_enabled(
+        &self,
+        board_indices: &[u8],
+        enabled: bool,
+    ) -> anyhow::Result<bool> {
+        if board_indices.is_empty() {
+            return Ok(true);
+        }
+
+        let current = self
+            .web
+            .send_command("miner/hw/hashboards", false, None, Method::GET)
+            .await?;
+        let hashboards = current
+            .get("hashboards")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("Braiins API did not return hashboard identifiers"))?;
+
+        let mut ids = Vec::with_capacity(board_indices.len());
+        for index in board_indices {
+            // Braiins exposes IDs starting at 1; asic-rs board positions start at 0.
+            let id = (u16::from(*index) + 1).to_string();
+            if !hashboards
+                .iter()
+                .any(|board| board.get("id").and_then(Value::as_str) == Some(id.as_str()))
+            {
+                anyhow::bail!("Hashboard index {index} is not available on this miner");
+            }
+            ids.push(id);
+        }
+
+        self.web
+            .send_command(
+                "miner/hw/hashboards",
+                true,
+                Some(json!({ "enable": enabled, "hashboard_ids": ids })),
+                Method::PATCH,
+            )
+            .await?;
+        Ok(true)
+    }
+
+    fn supports_set_hashboards_enabled(&self) -> bool {
+        true
     }
 }
 
 impl GetConfigsLocations for BraiinsV2507 {
     #[allow(unused_variables)]
     fn get_configs_locations(&self, data_field: ConfigField) -> Vec<ConfigLocation> {
-        vec![]
+        const GQL_TIMEZONE: MinerCommand = MinerCommand::GraphQL {
+            command: "{ bos { timezone { id } timezoneList { id } } }",
+        };
+        match data_field {
+            ConfigField::Timezone => vec![(
+                GQL_TIMEZONE,
+                ConfigExtractor {
+                    func: get_by_pointer,
+                    key: Some("/bos"),
+                    tag: None,
+                },
+            )],
+            _ => vec![],
+        }
     }
 }
 
@@ -222,6 +289,14 @@ impl GetDataLocations for BraiinsV2507 {
                 },
             )],
             DataField::IsMining => vec![(
+                WEB_MINER_DETAILS,
+                DataExtractor {
+                    func: get_by_pointer,
+                    key: Some("/status"),
+                    tag: None,
+                },
+            )],
+            DataField::OperatingState => vec![(
                 WEB_MINER_DETAILS,
                 DataExtractor {
                     func: get_by_pointer,
@@ -416,9 +491,9 @@ impl GetHashboards for BraiinsV2507 {
                     HashRate {
                         value: f,
                         unit: HashRateUnit::GigaHash,
-                        algo: "SHA256".to_string(),
+                        algo: self.device_info.algo,
                     }
-                    .as_unit(HashRateUnit::default())
+                    .as_default_unit()
                 });
             board.expected_hashrate = chain
                 .pointer("/stats/nominal_hashrate/gigahash_per_second")
@@ -427,9 +502,9 @@ impl GetHashboards for BraiinsV2507 {
                     HashRate {
                         value: f,
                         unit: HashRateUnit::GigaHash,
-                        algo: "SHA256".to_string(),
+                        algo: self.device_info.algo,
                     }
-                    .as_unit(HashRateUnit::default())
+                    .as_default_unit()
                 });
             board.board_temperature = chain
                 .pointer("/board_temp/degree_c")
@@ -453,7 +528,10 @@ impl GetHashboards for BraiinsV2507 {
                 .pointer("/current_frequency/hertz")
                 .and_then(|v| v.as_f64())
                 .map(Frequency::from_hertz);
-            board.active = chain.pointer("/enabled").and_then(|v| v.as_bool());
+            board.active = board
+                .frequency
+                .as_ref()
+                .map(|frequency| frequency.as_megahertz() > 0.0);
         }
 
         hashboards
@@ -466,9 +544,9 @@ impl GetHashrate for BraiinsV2507 {
             HashRate {
                 value: f,
                 unit: HashRateUnit::GigaHash,
-                algo: "SHA256".to_string(),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default())
+            .as_default_unit()
         })
     }
 }
@@ -479,9 +557,9 @@ impl GetExpectedHashrate for BraiinsV2507 {
             HashRate {
                 value: f,
                 unit: HashRateUnit::GigaHash,
-                algo: "SHA256".to_string(),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default())
+            .as_default_unit()
         })
     }
 }
@@ -523,6 +601,27 @@ impl GetUptime for BraiinsV2507 {
     }
 }
 
+impl GetBestShare for BraiinsV2507 {}
+impl GetSessionBestShare for BraiinsV2507 {}
+
+impl GetOperatingState for BraiinsV2507 {
+    fn parse_operating_state(&self, data: &HashMap<DataField, Value>) -> Option<OperatingState> {
+        Some(match data.get(&DataField::OperatingState)?.as_u64()? {
+            0 => return None,
+            1 => OperatingState::Stopped {},
+            2 => OperatingState::Mining {},
+            3 => OperatingState::Paused {},
+            4 => OperatingState::Suspended {},
+            5 => OperatingState::Restricted {},
+            code => OperatingState::Unknown {
+                raw: code.to_string(),
+            },
+        })
+    }
+}
+
+impl GetDevFeeConnected for BraiinsV2507 {}
+
 impl GetIsMining for BraiinsV2507 {
     fn parse_is_mining(&self, data: &HashMap<DataField, Value>) -> bool {
         // 1 -> Not Started
@@ -559,6 +658,9 @@ impl GetPools for BraiinsV2507 {
                 let rejected_shares = pool
                     .pointer("/stats/rejected_shares")
                     .and_then(|v| v.as_u64());
+                let last_share_time = pool
+                    .pointer("/stats/last_share_time/seconds")
+                    .and_then(|v| v.as_u64());
                 let active = pool.pointer("/active").and_then(|v| v.as_bool());
                 let alive = pool.pointer("/alive").and_then(|v| v.as_bool());
 
@@ -567,6 +669,7 @@ impl GetPools for BraiinsV2507 {
                     url,
                     accepted_shares,
                     rejected_shares,
+                    last_share_time,
                     active,
                     alive,
                     user,
@@ -615,14 +718,14 @@ impl GetWattage for BraiinsV2507 {
 impl GetTuningTarget for BraiinsV2507 {
     fn parse_tuning_target(&self, data: &HashMap<DataField, Value>) -> Option<TuningTarget> {
         data.get(&DataField::TuningTarget)
-            .and_then(parse_configured_tuning_target)
+            .and_then(|value| parse_configured_tuning_target(value, self.device_info.algo))
     }
 }
 
 impl GetScaledTuningTarget for BraiinsV2507 {
     fn parse_scaled_tuning_target(&self, data: &HashMap<DataField, Value>) -> Option<TuningTarget> {
         data.get(&DataField::TuningTarget)
-            .and_then(parse_scaled_tuning_target)
+            .and_then(|value| parse_scaled_tuning_target(value, self.device_info.algo))
     }
 }
 
@@ -633,11 +736,71 @@ impl GetTuningCapabilities for BraiinsV2507 {
         data: &HashMap<DataField, Value>,
     ) -> Option<TuningCapabilities> {
         let tuner = data.get(&DataField::TuningCapabilities)?;
-        Some(tuner_constraints_capabilities(tuner))
+        Some(tuner_constraints_capabilities(tuner, self.device_info.algo))
+    }
+}
+#[async_trait]
+impl SupportsTimezoneConfig for BraiinsV2507 {
+    fn supports_timezone_config(&self) -> bool {
+        true
+    }
+
+    fn parse_timezone_config(
+        &self,
+        data: &HashMap<ConfigField, Value>,
+    ) -> anyhow::Result<TimezoneConfig> {
+        let obj = data
+            .get(&ConfigField::Timezone)
+            .ok_or_else(|| anyhow::anyhow!("No timezone data returned"))?;
+        let timezone = obj
+            .pointer("/timezone/id")
+            .and_then(|v| v.as_str())
+            .map(|id| {
+                id.parse::<Tz>()
+                    .map_err(|_| anyhow::anyhow!("Unknown IANA timezone {id:?}"))
+            })
+            .transpose()?;
+        // BOS ids are IANA names already; drop any the bundled database lacks
+        // rather than failing the whole read over one unknown entry.
+        let available = obj
+            .pointer("/timezoneList")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.get("id").and_then(|v| v.as_str()))
+                    .filter_map(|id| id.parse::<Tz>().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(TimezoneConfig {
+            timezone,
+            available,
+        })
+    }
+
+    /// BOS speaks IANA natively, so the zone name goes over the wire as is.
+    async fn set_timezone_config(&self, config: TimezoneConfig) -> anyhow::Result<bool> {
+        let timezone = config
+            .timezone
+            .ok_or_else(|| anyhow::anyhow!("Timezone config has no timezone to set"))?;
+        let mutation = r#"mutation ($tz: String!) {
+            bos { setTimezone(timezone: $tz) { __typename } }
+        }"#;
+        let variables = json!({ "tz": timezone.name() });
+        let result = self
+            .graphql
+            .send_graphql_command(mutation, true, Some(variables))
+            .await?;
+        // BosResult is a union; a `BosError` variant signals failure.
+        let typename = result
+            .pointer("/bos/setTimezone/__typename")
+            .and_then(|v| v.as_str());
+        Ok(matches!(typename, Some(t) if t != "BosError"))
     }
 }
 
 impl GetPsuFans for BraiinsV2507 {}
+impl GetPsus for BraiinsV2507 {}
 
 impl GetMessages for BraiinsV2507 {
     fn parse_messages(&self, data: &HashMap<DataField, Value>) -> Vec<MinerMessage> {
@@ -675,11 +838,10 @@ impl GetMessages for BraiinsV2507 {
 #[async_trait]
 impl SetFaultLight for BraiinsV2507 {
     async fn set_fault_light(&self, fault: bool) -> anyhow::Result<bool> {
-        Ok(self
-            .web
+        self.web
             .send_command("actions/locate", true, Some(json!(fault)), Method::PUT)
-            .await
-            .is_ok())
+            .await?;
+        Ok(true)
     }
     fn supports_set_fault_light(&self) -> bool {
         true
@@ -689,16 +851,15 @@ impl SetFaultLight for BraiinsV2507 {
 #[async_trait]
 impl SetPowerLimit for BraiinsV2507 {
     async fn set_power_limit(&self, limit: Power) -> anyhow::Result<bool> {
-        Ok(self
-            .web
+        self.web
             .send_command(
                 "performance/power-target",
                 true,
                 Some(json!({"watt": limit.as_watts() as u64})),
                 Method::PUT,
             )
-            .await
-            .is_ok())
+            .await?;
+        Ok(true)
     }
     fn supports_set_power_limit(&self) -> bool {
         true
@@ -741,11 +902,10 @@ impl SupportsPoolsConfig for BraiinsV2507 {
             })
             .collect();
 
-        Ok(self
-            .web
+        self.web
             .send_command("pools/batch", true, Some(json!(groups)), Method::PUT)
-            .await
-            .is_ok())
+            .await?;
+        Ok(true)
     }
 
     fn supports_pools_config(&self) -> bool {
@@ -756,11 +916,12 @@ impl SupportsPoolsConfig for BraiinsV2507 {
 #[async_trait]
 impl Restart for BraiinsV2507 {
     async fn restart(&self) -> anyhow::Result<bool> {
-        Ok(self
-            .web
+        // The reboot endpoint answers `204 No Content`. Anything else is the
+        // firmware refusing, and its reason is worth more than `false`.
+        self.web
             .send_command("actions/reboot", true, None, Method::PUT)
-            .await
-            .is_ok())
+            .await?;
+        Ok(true)
     }
     fn supports_restart(&self) -> bool {
         true
@@ -771,11 +932,10 @@ impl Restart for BraiinsV2507 {
 impl Pause for BraiinsV2507 {
     #[allow(unused_variables)]
     async fn pause(&self, at_time: Option<Duration>) -> anyhow::Result<bool> {
-        Ok(self
-            .web
+        self.web
             .send_command("actions/pause", true, None, Method::PUT)
-            .await
-            .is_ok())
+            .await?;
+        Ok(true)
     }
     fn supports_pause(&self) -> bool {
         true
@@ -786,11 +946,10 @@ impl Pause for BraiinsV2507 {
 impl Resume for BraiinsV2507 {
     #[allow(unused_variables)]
     async fn resume(&self, at_time: Option<Duration>) -> anyhow::Result<bool> {
-        Ok(self
-            .web
+        self.web
             .send_command("actions/resume", true, None, Method::PUT)
-            .await
-            .is_ok())
+            .await?;
+        Ok(true)
     }
     fn supports_resume(&self) -> bool {
         true
@@ -829,6 +988,26 @@ impl FactoryReset for BraiinsV2507 {
         false
     }
 }
+
+#[async_trait]
+impl RestartMining for BraiinsV2507 {
+    async fn restart_mining(&self) -> anyhow::Result<bool> {
+        // `actions/restart` restarts BOSminer only; `actions/reboot` reboots the OS.
+        self.web
+            .send_command("actions/restart", true, None, Method::PUT)
+            .await?;
+        Ok(true)
+    }
+
+    fn supports_restart_mining(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(test)]
+mod restart_mining_tests;
+
+impl RestoreStockOs for BraiinsV2507 {}
 
 #[async_trait]
 impl SupportsScalingConfig for BraiinsV2507 {
@@ -883,6 +1062,8 @@ impl SupportsTemperatureConfig for BraiinsV2507 {}
 impl GetTuningPercent for BraiinsV2507 {}
 impl SetTuningPercent for BraiinsV2507 {}
 
+impl SupportsPresets for BraiinsV2507 {}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -907,6 +1088,87 @@ mod tests {
         WEB_NETWORK_COMMAND as V11_NETWORK, WEB_PERFORMANCE_TUNER_STATE_COMMAND as V11_TUNER,
         WEB_POOLS_COMMAND as V11_POOLS, WEB_VERSION_COMMAND as V11_VERSION,
     };
+
+    /// Answer the login, then answer one more request with `response` and
+    /// hand that request back.
+    async fn mock_web_server(
+        response: &'static str,
+    ) -> anyhow::Result<(u16, tokio::task::JoinHandle<anyhow::Result<String>>)> {
+        use anyhow::Context;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const LOGIN: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 22\r\nConnection: close\r\n\r\n{\"token\":\"test-token\"}";
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let task = tokio::spawn(async move {
+            let mut request = Vec::new();
+            for response in [LOGIN, response] {
+                let (mut socket, _) =
+                    tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                        .await
+                        .context("timed out waiting for HTTP request")??;
+                request.clear();
+                let mut chunk = [0_u8; 1024];
+                // The login carries a body; one read past the headers is
+                // enough for a request this small.
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let bytes_read = socket.read(&mut chunk).await?;
+                    if bytes_read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..bytes_read]);
+                }
+                socket.write_all(response.as_bytes()).await?;
+            }
+            Ok(String::from_utf8(request)?)
+        });
+
+        Ok((port, task))
+    }
+
+    fn miner_with_mock_web(port: u16) -> BraiinsV2507 {
+        let ip = IpAddr::from([127, 0, 0, 1]);
+        let mut miner = BraiinsV2507::new(ip, AntMinerModel::S21Pro);
+        miner.web = BraiinsWebAPI::new_with_port(ip, port, MinerAuth::new("root", "root"));
+        miner
+    }
+
+    #[tokio::test]
+    async fn restart_accepts_empty_204_response() -> anyhow::Result<()> {
+        let (port, task) =
+            mock_web_server("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").await?;
+        let miner = miner_with_mock_web(port);
+
+        assert!(miner.restart().await?);
+
+        let request = task.await??;
+        assert!(request.starts_with("PUT /api/v1/actions/reboot HTTP/1.1\r\n"));
+        assert!(
+            request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("authorization: test-token"))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_reports_why_the_firmware_refused() -> anyhow::Result<()> {
+        let (port, task) = mock_web_server(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 22\r\nConnection: close\r\n\r\nreboot is not possible",
+        )
+        .await?;
+        let miner = miner_with_mock_web(port);
+
+        let error = miner.restart().await.unwrap_err().to_string();
+
+        task.await??;
+        assert!(error.contains("500"), "{error}");
+        assert!(error.contains("reboot is not possible"), "{error}");
+
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_braiins_v25_07() {
@@ -1024,6 +1286,14 @@ mod tests {
         );
         assert_eq!(miner_data.pools.len(), 1);
         assert_eq!(miner_data.pools[0].len(), 2);
+        assert_eq!(
+            miner_data.pools[0].pools[0].last_share_time,
+            Some(1_776_446_524)
+        );
+        assert_eq!(
+            miner_data.pools[0].pools[1].last_share_time,
+            Some(1_776_395_827)
+        );
         assert!(miner_data.hashrate.is_some());
         assert!(miner_data.expected_hashrate.is_some());
     }
@@ -1172,7 +1442,7 @@ mod tests {
             Some(TuningTarget::HashRate(HashRate {
                 value: 120.5,
                 unit: HashRateUnit::TeraHash,
-                algo: "SHA256".to_string(),
+                algo: HashAlgorithm::SHA256,
             }))
         );
         assert_eq!(
@@ -1180,8 +1450,131 @@ mod tests {
             Some(TuningTarget::HashRate(HashRate {
                 value: 118.25,
                 unit: HashRateUnit::TeraHash,
-                algo: "SHA256".to_string(),
+                algo: HashAlgorithm::SHA256,
             }))
         );
+    }
+
+    /// Answers the login this backend always makes first, then the control
+    /// request with `(status, reason, body)`, and hands back that request.
+    async fn mock_miner(
+        status: u16,
+        reason: &'static str,
+        body: &'static str,
+    ) -> anyhow::Result<(
+        BraiinsV2507,
+        tokio::task::JoinHandle<anyhow::Result<String>>,
+    )> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let ip = IpAddr::from([127, 0, 0, 1]);
+        let mut miner = BraiinsV2507::new(ip, AntMinerModel::S19XP);
+        miner.web = BraiinsWebAPI::new_with_port(
+            ip,
+            listener.local_addr()?.port(),
+            MinerAuth::new("root", "root"),
+        );
+
+        let task = tokio::spawn(async move {
+            let mut last_request = String::new();
+            for (status, reason, body) in [
+                (200, "OK", r#"{"token":"test-token"}"#),
+                (status, reason, body),
+            ] {
+                let (mut socket, _) =
+                    tokio::time::timeout(Duration::from_secs(2), listener.accept()).await??;
+
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                loop {
+                    if let Some(header_end) = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|position| position + 4)
+                    {
+                        let headers = std::str::from_utf8(&request[..header_end])?;
+                        let content_length = headers
+                            .lines()
+                            .filter_map(|line| line.split_once(':'))
+                            .find_map(|(name, value)| {
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or_default();
+                        if request.len() >= header_end + content_length {
+                            break;
+                        }
+                    }
+                    let bytes_read = socket.read(&mut chunk).await?;
+                    if bytes_read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..bytes_read]);
+                }
+                last_request = String::from_utf8(request)?;
+
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await?;
+            }
+            Ok(last_request)
+        });
+
+        Ok((miner, task))
+    }
+
+    #[tokio::test]
+    async fn control_calls_report_why_the_miner_refused() -> anyhow::Result<()> {
+        let refusal = r#"{"message":"BOSminer is not running"}"#;
+
+        let (miner, task) = mock_miner(412, "Precondition Failed", refusal).await?;
+        let error = miner.pause(None).await.unwrap_err();
+        assert!(
+            task.await??
+                .starts_with("PUT /api/v1/actions/pause HTTP/1.1\r\n")
+        );
+        assert!(error.to_string().contains("412"), "{error}");
+        assert!(error.to_string().contains(refusal), "{error}");
+
+        let (miner, task) = mock_miner(412, "Precondition Failed", refusal).await?;
+        let error = miner.resume(None).await.unwrap_err();
+        assert!(
+            task.await??
+                .starts_with("PUT /api/v1/actions/resume HTTP/1.1\r\n")
+        );
+        assert!(error.to_string().contains("412"), "{error}");
+        assert!(error.to_string().contains(refusal), "{error}");
+
+        let (miner, task) = mock_miner(412, "Precondition Failed", refusal).await?;
+        let error = miner.set_fault_light(true).await.unwrap_err();
+        assert!(
+            task.await??
+                .starts_with("PUT /api/v1/actions/locate HTTP/1.1\r\n")
+        );
+        assert!(error.to_string().contains("412"), "{error}");
+        assert!(error.to_string().contains(refusal), "{error}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepted_control_calls_still_return_true() -> anyhow::Result<()> {
+        let (miner, task) = mock_miner(200, "OK", r#"{"already_paused":false}"#).await?;
+        assert!(miner.pause(None).await?);
+        task.await??;
+
+        let (miner, task) = mock_miner(200, "OK", r#"{"already_running":false}"#).await?;
+        assert!(miner.resume(None).await?);
+        task.await??;
+
+        let (miner, task) = mock_miner(200, "OK", "true").await?;
+        assert!(miner.set_fault_light(true).await?);
+        task.await??;
+
+        Ok(())
     }
 }

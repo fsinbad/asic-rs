@@ -1,34 +1,110 @@
-use std::{net::IpAddr, time::Duration};
+use std::{collections::HashMap, net::IpAddr, time::Duration};
 
 use macaddr::MacAddr;
-use measurements::{Power, Temperature};
+use measurements::{Frequency, Power, Temperature, Voltage};
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
+#[cfg(feature = "python")]
+use super::collector::{DataField, FieldCollectionStatus};
 use super::{
     board::{BoardData, MinerControlBoard},
     capabilities::TuningCapabilities,
+    collector::CollectionDiagnostics,
     device::DeviceInfo,
     fan::FanData,
     hashrate::HashRate,
     message::MinerMessage,
+    operating_state::OperatingState,
     pool::PoolGroupData,
+    psu::PsuData,
 };
 use crate::data::{
     deserialize::deserialize_macaddr,
     serialize::{serialize_macaddr, serialize_power, serialize_temperature},
 };
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Manual set points by board ID: (frequency, voltage). Missing measurements
+/// remain `None`; an empty map means no board set points were reported.
+pub type ManualTuningTargets = HashMap<u8, (Option<Frequency>, Option<Voltage>)>;
+
+/// Scalar manual set points by board ID: (megahertz, volts).
+pub type ManualTuningValues = HashMap<u8, (Option<f64>, Option<f64>)>;
+
+pub(crate) fn manual_targets_to_values(targets: &ManualTuningTargets) -> ManualTuningValues {
+    targets
+        .iter()
+        .map(|(&id, &(frequency, voltage))| {
+            (
+                id,
+                (
+                    frequency.map(|f| f.as_megahertz()),
+                    voltage.map(|v| v.as_volts()),
+                ),
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn manual_targets_from_values(values: ManualTuningValues) -> ManualTuningTargets {
+    values
+        .into_iter()
+        .map(|(id, (frequency, voltage))| {
+            (
+                id,
+                (
+                    frequency.map(Frequency::from_megahertz),
+                    voltage.map(Voltage::from_volts),
+                ),
+            )
+        })
+        .collect()
+}
+
+mod manual_targets_serde {
+    use super::*;
+
+    pub fn serialize<S: serde::Serializer>(
+        targets: &ManualTuningTargets,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        manual_targets_to_values(targets).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<ManualTuningTargets, D::Error> {
+        ManualTuningValues::deserialize(deserializer).map(manual_targets_from_values)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 /// Firmware tuning target reported by a miner or requested by configuration.
+///
+/// [`TuningTarget::Manual`] means perpetual/autotuning is disabled. Every other
+/// variant represents a firmware-managed tuning target and implies that tuning
+/// is enabled.
 pub enum TuningTarget {
+    /// Use manual tuning with perpetual tuning disabled.
+    ///
+    /// Set points are optional because some firmware responses report that
+    /// tuning is disabled without reporting one or both configured values.
+    Manual {
+        /// Board IDs mapped to (frequency, voltage), serialized as (MHz, volts).
+        #[serde(default, with = "manual_targets_serde")]
+        #[ts(type = "Record<number, [number | null, number | null]>")]
+        boards: ManualTuningTargets,
+    },
     /// Target a power limit.
-    Power(Power),
+    Power(#[ts(type = "{ watts: number }")] Power),
     /// Target a hashrate.
     HashRate(HashRate),
     /// Target a named mining mode.
     MiningMode(MiningMode),
+    /// Target a named firmware preset (e.g. VNish autotune presets).
+    Preset(String),
 }
 
 impl TuningTarget {
@@ -41,7 +117,7 @@ impl TuningTarget {
 #[cfg_attr(feature = "python", pyclass(from_py_object, str, module = "asic_rs"))]
 #[cfg_attr(feature = "python", derive(asic_rs_pydantic::PyPydanticEnum))]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Serialize, Deserialize, strum::Display, strum::EnumString,
+    Debug, Clone, Copy, PartialEq, Serialize, Deserialize, strum::Display, strum::EnumString, TS,
 )]
 /// Firmware-defined mining performance mode.
 pub enum MiningMode {
@@ -58,7 +134,7 @@ pub enum MiningMode {
 
 #[cfg_attr(feature = "python", pyclass(from_py_object, module = "asic_rs"))]
 #[cfg_attr(feature = "python", asic_rs_pydantic::py_pydantic_model(getters))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 /// Standardized telemetry snapshot for one miner.
 pub struct MinerData {
     /// The schema version of this MinerData object, for use in external APIs
@@ -72,6 +148,7 @@ pub struct MinerData {
         serialize_with = "serialize_macaddr",
         deserialize_with = "deserialize_macaddr"
     )]
+    #[ts(type = "string | null")]
     pub mac: Option<MacAddr>,
     /// Hardware information about this miner
     pub device_info: DeviceInfo,
@@ -103,17 +180,25 @@ pub struct MinerData {
     pub fans: Vec<FanData>,
     /// The current PDU fan information for the miner
     pub psu_fans: Vec<FanData>,
+    /// Power supply telemetry. `None` when the firmware does not report PSU details.
+    #[serde(default)]
+    #[cfg_attr(feature = "python", pydantic(default = None))]
+    pub psus: Option<Vec<PsuData>>,
     /// The average temperature across all chips in the miner
     #[serde(serialize_with = "serialize_temperature")]
+    #[ts(type = "number | null")]
     pub average_temperature: Option<Temperature>,
     /// The environment temperature of the miner, such as air temperature or immersion fluid temperature
     #[serde(serialize_with = "serialize_temperature")]
+    #[ts(type = "number | null")]
     pub fluid_temperature: Option<Temperature>,
     /// The coolant exhaust temperature, only for water-cooled miners with dedicated sensors
     #[serde(serialize_with = "serialize_temperature")]
+    #[ts(type = "number | null")]
     pub outlet_fluid_temperature: Option<Temperature>,
     /// The current power consumption of the miner
     #[serde(serialize_with = "serialize_power")]
+    #[ts(type = "number | null")]
     pub wattage: Option<Power>,
     /// The current manual tuning percent of full power (100 = unthrottled), where supported
     pub tuning_percent: Option<u8>,
@@ -131,13 +216,87 @@ pub struct MinerData {
     /// Any message on the miner, including errors
     pub messages: Vec<MinerMessage>,
     /// The total uptime of the miner's system
+    #[ts(type = "{ secs: number, nanos: number } | null")]
     pub uptime: Option<Duration>,
     /// Whether the hashing process is currently running,
     /// false if paused, true if running, even if the hashrate is 0
+    /// or the firmware is tuning. This legacy flag may default when data is
+    /// missing; use `operating_state` for explicit detailed state telemetry.
     pub is_mining: bool,
+    /// Detailed state explicitly reported by firmware, independent of `is_mining`.
+    /// Unavailable, invalid, and boolean-only status responses leave this `None`.
+    #[serde(default)]
+    #[cfg_attr(feature = "python", pydantic(default = None))]
+    pub operating_state: Option<OperatingState>,
+    /// Whether the firmware's developer-fee connection is online.
+    ///
+    /// `None` means the firmware does not expose a developer-fee status.
+    #[serde(default)]
+    #[cfg_attr(feature = "python", pydantic(default = None))]
+    pub devfee_connected: Option<bool>,
     /// The current pools configured on the miner
     pub pools: Vec<PoolGroupData>,
+    /// Difficulty of the best share found over the miner's lifetime, when reported.
+    ///
+    /// This is a dimensionless share difficulty (not hashrate). Firmware that
+    /// only expose a single best-share value should populate this field and
+    /// leave [`Self::session_best_share`] as `None`.
+    pub best_share: Option<f64>,
+    /// Difficulty of the best share found since the last boot or hashing start,
+    /// when the firmware distinguishes session from all-time.
+    pub session_best_share: Option<f64>,
 }
+
+/// A telemetry snapshot accompanied by the outcome of its raw API reads.
+/// Applications must still validate parsed values for their own use case.
+#[cfg_attr(feature = "python", pyclass(from_py_object, module = "asic_rs"))]
+#[derive(Debug, Clone)]
+pub struct CheckedMinerData {
+    pub data: MinerData,
+    pub diagnostics: CollectionDiagnostics,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl CheckedMinerData {
+    #[getter]
+    fn data(&self) -> MinerData {
+        self.data.clone()
+    }
+
+    #[getter]
+    fn field_status(&self) -> HashMap<DataField, FieldCollectionStatus> {
+        self.diagnostics.field_status.clone()
+    }
+
+    #[getter]
+    fn successful_commands(&self) -> usize {
+        self.diagnostics.successful_commands
+    }
+
+    #[getter]
+    fn failed_commands(&self) -> usize {
+        self.diagnostics.failed_commands
+    }
+}
+
+/// No requested telemetry field could be extracted from the miner responses.
+#[derive(Debug)]
+pub struct NoTelemetryError {
+    pub diagnostics: CollectionDiagnostics,
+}
+
+impl std::fmt::Display for NoTelemetryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no miner telemetry fields collected ({} commands succeeded, {} failed)",
+            self.diagnostics.successful_commands, self.diagnostics.failed_commands
+        )
+    }
+}
+
+impl std::error::Error for NoTelemetryError {}
 
 #[cfg(feature = "python")]
 pub use python_tuning_target::PyTuningTarget;
@@ -151,18 +310,31 @@ mod python_tuning_target {
     use measurements::Power;
     use pyo3::{exceptions::PyValueError, prelude::*, types::PyAnyMethods};
 
-    use super::{HashRate, MiningMode, TuningTarget};
+    use super::{
+        HashRate, ManualTuningValues, MiningMode, TuningTarget, manual_targets_from_values,
+        manual_targets_to_values,
+    };
 
     #[pyclass(name = "TuningTarget", skip_from_py_object, module = "asic_rs")]
     #[derive(Debug, Clone, PartialEq)]
     pub enum PyTuningTarget {
+        Manual { boards: ManualTuningValues },
         Power { watts: f64 },
         HashRate { target_hashrate: HashRate },
         Mode { target_mode: MiningMode },
+        Preset { name: String },
     }
 
     #[pymethods]
     impl PyTuningTarget {
+        #[staticmethod]
+        #[pyo3(signature = (boards = None))]
+        fn manual(boards: Option<ManualTuningValues>) -> Self {
+            Self::Manual {
+                boards: boards.unwrap_or_default(),
+            }
+        }
+
         #[staticmethod]
         fn power(watts: f64) -> Self {
             Self::Power { watts }
@@ -180,12 +352,28 @@ mod python_tuning_target {
             Self::Mode { target_mode: mode }
         }
 
+        #[staticmethod]
+        fn preset(name: String) -> Self {
+            Self::Preset { name }
+        }
+
         #[getter]
         fn variant(&self) -> &'static str {
             match self {
+                Self::Manual { .. } => "manual",
                 Self::Power { .. } => "power",
                 Self::HashRate { .. } => "hashrate",
                 Self::Mode { .. } => "mode",
+                Self::Preset { .. } => "preset",
+            }
+        }
+
+        /// Board IDs mapped to (frequency in MHz, voltage in volts).
+        #[getter]
+        fn boards(&self) -> Option<ManualTuningValues> {
+            match self {
+                Self::Manual { boards } => Some(boards.clone()),
+                _ => None,
             }
         }
 
@@ -215,13 +403,40 @@ mod python_tuning_target {
             }
         }
 
+        #[getter]
+        fn preset_name(&self) -> Option<String> {
+            match self {
+                Self::Preset { name } => Some(name.clone()),
+                _ => None,
+            }
+        }
+
         fn __repr__(&self) -> String {
             match self {
+                Self::Manual { boards } => {
+                    let mut entries: Vec<_> = boards.iter().collect();
+                    entries.sort_by_key(|(id, _)| **id);
+                    let entries = entries
+                        .into_iter()
+                        .map(|(id, (frequency, voltage))| {
+                            let frequency = frequency
+                                .map(|v| format!("{v:?}"))
+                                .unwrap_or_else(|| "None".to_owned());
+                            let voltage = voltage
+                                .map(|v| format!("{v:?}"))
+                                .unwrap_or_else(|| "None".to_owned());
+                            format!("{id}: ({frequency}, {voltage})")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("TuningTarget.manual(boards={{{entries}}})")
+                }
                 Self::Power { watts } => format!("TuningTarget.power(watts={watts:?})"),
                 Self::HashRate { target_hashrate } => {
                     format!("TuningTarget.hashrate(hashrate={target_hashrate})")
                 }
                 Self::Mode { target_mode } => format!("TuningTarget.mode(mode={target_mode})"),
+                Self::Preset { name } => format!("TuningTarget.preset(name={name:?})"),
             }
         }
 
@@ -233,6 +448,9 @@ mod python_tuning_target {
     impl From<TuningTarget> for PyTuningTarget {
         fn from(value: TuningTarget) -> Self {
             match value {
+                TuningTarget::Manual { boards } => Self::Manual {
+                    boards: manual_targets_to_values(&boards),
+                },
                 TuningTarget::Power(power) => Self::Power {
                     watts: power.as_watts(),
                 },
@@ -240,6 +458,7 @@ mod python_tuning_target {
                     target_hashrate: hashrate,
                 },
                 TuningTarget::MiningMode(mode) => Self::Mode { target_mode: mode },
+                TuningTarget::Preset(name) => Self::Preset { name },
             }
         }
     }
@@ -247,11 +466,15 @@ mod python_tuning_target {
     impl From<PyTuningTarget> for TuningTarget {
         fn from(value: PyTuningTarget) -> Self {
             match value {
+                PyTuningTarget::Manual { boards } => TuningTarget::Manual {
+                    boards: manual_targets_from_values(boards),
+                },
                 PyTuningTarget::Power { watts } => TuningTarget::Power(Power::from_watts(watts)),
                 PyTuningTarget::HashRate { target_hashrate } => {
                     TuningTarget::HashRate(target_hashrate)
                 }
                 PyTuningTarget::Mode { target_mode } => TuningTarget::MiningMode(target_mode),
+                PyTuningTarget::Preset { name } => TuningTarget::Preset(name),
             }
         }
     }
@@ -276,6 +499,18 @@ mod python_tuning_target {
             core_schema: &Bound<'py, PyAny>,
             mode: PydanticSchemaMode,
         ) -> PyResult<Bound<'py, PyAny>> {
+            let number = <Option<f64> as PyPydanticType>::pydantic_schema(core_schema, mode)?;
+            let pair = core_schema.call_method1("tuple_schema", (vec![number.clone(), number],))?;
+            let key_options = pyo3::types::PyDict::new(core_schema.py());
+            use pyo3::types::PyDictMethods;
+            key_options.set_item("ge", 0)?;
+            key_options.set_item("le", u8::MAX)?;
+            let key = core_schema.call_method("int_schema", (), Some(&key_options))?;
+            let manual_value_schema = core_schema.call_method1("dict_schema", (key, pair))?;
+            let manual_schema = pydantic_typed_dict_schema!(core_schema, "asic_rs.TuningTargetManual", {
+                "type" => required(literal_schema(core_schema, &["manual"])?),
+                "value" => required(manual_value_schema),
+            })?;
             let power_schema = pydantic_typed_dict_schema!(core_schema, "asic_rs.TuningTargetPower", {
                 "type" => required(literal_schema(core_schema, &["power"])?),
                 "value" => required(<Power as PyPydanticType>::pydantic_schema(core_schema, mode)?),
@@ -288,12 +523,18 @@ mod python_tuning_target {
                 "type" => required(literal_schema(core_schema, &["mode"])?),
                 "value" => required(<MiningMode as PyPydanticType>::pydantic_schema(core_schema, mode)?),
             })?;
+            let preset_schema = pydantic_typed_dict_schema!(core_schema, "asic_rs.TuningTargetPreset", {
+                "type" => required(literal_schema(core_schema, &["preset"])?),
+                "value" => required(<String as PyPydanticType>::pydantic_schema(core_schema, mode)?),
+            })?;
             let tagged_union = tagged_union_schema(
                 core_schema,
                 [
+                    ("manual", manual_schema),
                     ("power", power_schema),
                     ("hashrate", hashrate_schema),
                     ("mode", mode_schema),
+                    ("preset", preset_schema),
                 ],
                 "type",
                 Some("asic_rs.TuningTarget"),
@@ -315,6 +556,9 @@ mod python_tuning_target {
             let type_str: String = get_required_field(value, "type")?.extract()?;
             let v = get_required_field(value, "value")?;
             match type_str.as_str() {
+                "manual" => Ok(TuningTarget::Manual {
+                    boards: manual_targets_from_values(v.extract()?),
+                }),
                 "power" => Ok(TuningTarget::Power(
                     <Power as PyPydanticType>::from_pydantic(&v)?,
                 )),
@@ -324,8 +568,11 @@ mod python_tuning_target {
                 "mode" => Ok(TuningTarget::MiningMode(
                     <MiningMode as PyPydanticType>::from_pydantic(&v)?,
                 )),
+                "preset" => Ok(TuningTarget::Preset(
+                    <String as PyPydanticType>::from_pydantic(&v)?,
+                )),
                 _ => Err(PyValueError::new_err(format!(
-                    "Unknown TuningTarget type '{type_str}', expected 'power', 'hashrate', or 'mode'"
+                    "Unknown TuningTarget type '{type_str}', expected 'manual', 'power', 'hashrate', 'mode', or 'preset'"
                 ))),
             }
         }
@@ -334,6 +581,10 @@ mod python_tuning_target {
             use pyo3::types::{PyDict, PyDictMethods};
             let dict = PyDict::new(py);
             match self {
+                TuningTarget::Manual { boards } => {
+                    dict.set_item("type", "manual")?;
+                    dict.set_item("value", manual_targets_to_values(boards))?;
+                }
                 TuningTarget::Power(p) => {
                     dict.set_item("type", "power")?;
                     dict.set_item("value", <Power as PyPydanticType>::to_pydantic_data(p, py)?)?;
@@ -352,6 +603,13 @@ mod python_tuning_target {
                         <MiningMode as PyPydanticType>::to_pydantic_data(m, py)?,
                     )?;
                 }
+                TuningTarget::Preset(name) => {
+                    dict.set_item("type", "preset")?;
+                    dict.set_item(
+                        "value",
+                        <String as PyPydanticType>::to_pydantic_data(name, py)?,
+                    )?;
+                }
             }
             Ok(dict.into_any().unbind())
         }
@@ -362,5 +620,52 @@ mod python_tuning_target {
                 .into_pyobject(py)
                 .map(|b| b.into_any().unbind())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_tuning_target_serialization_round_trips() -> anyhow::Result<()> {
+        let target = TuningTarget::Manual {
+            boards: HashMap::from([
+                (
+                    0,
+                    (
+                        Some(Frequency::from_megahertz(480.0)),
+                        Some(Voltage::from_volts(12.6)),
+                    ),
+                ),
+                (
+                    3,
+                    (
+                        Some(Frequency::from_megahertz(490.0)),
+                        Some(Voltage::from_volts(12.7)),
+                    ),
+                ),
+                (7, (None, Some(Voltage::from_volts(12.5)))),
+                (8, (Some(Frequency::from_megahertz(500.0)), None)),
+                (9, (None, None)),
+            ]),
+        };
+        let encoded = serde_json::to_value(&target)?;
+        assert_eq!(
+            encoded,
+            serde_json::json!({"Manual": {"boards": {
+                "0": [480.0, 12.6], "3": [490.0, 12.7], "7": [null, 12.5],
+                "8": [500.0, null], "9": [null, null],
+            }}})
+        );
+        assert_eq!(target, serde_json::from_value(encoded)?);
+        let empty = TuningTarget::Manual {
+            boards: HashMap::new(),
+        };
+        assert_eq!(
+            empty,
+            serde_json::from_value(serde_json::to_value(&empty)?)?
+        );
+        Ok(())
     }
 }

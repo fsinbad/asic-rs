@@ -1,19 +1,21 @@
 use std::{fmt, fmt::Display, net::IpAddr};
 
+use asic_rs_core::traits::model::MinerModelAlgorithm;
 use asic_rs_core::{
     data::{
-        command::MinerCommand,
+        command::DiscoveryCommand,
         device::{HashAlgorithm, MinerHardware},
     },
     discovery::HTTP_WEB_ROOT,
     errors::ModelSelectionError,
     traits::{
+        auth::HasAuth,
         discovery::DiscoveryCommands,
         entry::FirmwareEntry,
         firmware::MinerFirmware,
         identification::{FirmwareIdentification, WebResponse},
         make::MinerMake,
-        miner::{Miner, MinerAuth, MinerConstructor},
+        miner::{Miner, MinerAuth},
         model::{MinerModel, UnknownMinerModel},
     },
     util::build_discovery_client,
@@ -76,7 +78,9 @@ impl MinerModel for EPicCompatibleModel {
             Self::Unknown(m) => m.is_known(),
         }
     }
+}
 
+impl MinerModelAlgorithm for EPicCompatibleModel {
     fn hash_algorithm(&self) -> HashAlgorithm {
         match self {
             Self::AntMiner(m) => m.hash_algorithm(),
@@ -98,14 +102,15 @@ impl Display for EPicFirmware {
 }
 
 impl DiscoveryCommands for EPicFirmware {
-    fn get_discovery_commands(&self) -> Vec<MinerCommand> {
+    fn get_discovery_commands(&self) -> Vec<DiscoveryCommand> {
         vec![HTTP_WEB_ROOT]
     }
 }
 
-#[async_trait]
-impl MinerFirmware for EPicFirmware {
-    async fn get_model(ip: IpAddr) -> Result<impl MinerModel + Send, ModelSelectionError> {
+impl EPicFirmware {
+    async fn get_model_and_uninstall_support(
+        ip: IpAddr,
+    ) -> Result<(EPicCompatibleModel, bool), ModelSelectionError> {
         let url = format!("http://{}:4028/capabilities", ip);
         let response = build_discovery_client()?
             .get(&url)
@@ -118,6 +123,7 @@ impl MinerFirmware for EPicFirmware {
             .await
             .map_err(|_| ModelSelectionError::UnexpectedModelResponse)?;
 
+        let uninstall_supported = json_data["UninstallSupported"].as_bool().unwrap_or(false);
         let model_base = json_data["Model"]
             .as_str()
             .ok_or(ModelSelectionError::UnexpectedModelResponse)?;
@@ -129,11 +135,14 @@ impl MinerFirmware for EPicFirmware {
             .to_uppercase();
 
         if model_upper == "UNDEFINED" {
-            return Ok(EPicCompatibleModel::Unknown(UnknownMinerModel {
-                name: model_base.to_string(),
-            }));
+            return Ok((
+                EPicCompatibleModel::Unknown(UnknownMinerModel {
+                    name: model_base.to_string(),
+                }),
+                uninstall_supported,
+            ));
         }
-        if model_upper.starts_with("ANTMINER") {
+        let model = if model_upper.starts_with("ANTMINER") {
             AntMinerMake::parse_model(model_upper.clone())
                 .map(EPicCompatibleModel::AntMiner)
                 .or(Ok(EPicCompatibleModel::Unknown(UnknownMinerModel {
@@ -163,7 +172,19 @@ impl MinerFirmware for EPicFirmware {
                 .or(Ok(EPicCompatibleModel::Unknown(UnknownMinerModel {
                     name: model_base.to_string(),
                 })))
-        }
+        }?;
+        Ok((model, uninstall_supported))
+    }
+}
+
+#[async_trait]
+impl MinerFirmware for EPicFirmware {
+    type Model = EPicCompatibleModel;
+
+    async fn get_model(ip: IpAddr) -> Result<Self::Model, ModelSelectionError> {
+        Self::get_model_and_uninstall_support(ip)
+            .await
+            .map(|(model, _)| model)
     }
 
     async fn get_version(ip: IpAddr) -> Option<semver::Version> {
@@ -190,12 +211,13 @@ impl FirmwareEntry for EPicFirmware {
         ip: IpAddr,
         auth: Option<&MinerAuth>,
     ) -> Result<Box<dyn Miner>, ModelSelectionError> {
-        let model = EPicFirmware::get_model(ip).await?;
+        let (model, uninstall_supported) = Self::get_model_and_uninstall_support(ip).await?;
         let version = EPicFirmware::get_version(ip).await;
-        let mut miner = crate::backends::PowerPlay::new(ip, model, version);
+        let mut miner = crate::backends::PowerPlay::build(ip, model, version);
         if let Some(auth) = auth {
             miner.set_auth(auth.clone());
         }
-        Ok(miner)
+        miner.set_restore_stock_os_support(uninstall_supported);
+        Ok(Box::new(miner))
     }
 }

@@ -60,7 +60,8 @@ impl APIClient for WhatsMinerV1 {
         match command {
             MinerCommand::RPC { .. } => self.rpc.get_api_result(command).await,
             _ => Err(anyhow::anyhow!(
-                "Unsupported command type for WhatsMiner API"
+                "Unsupported command type for {} API",
+                WhatsMinerFirmware::default()
             )),
         }
     }
@@ -265,6 +266,7 @@ impl GetMAC for WhatsMinerV1 {
 }
 
 impl GetSerialNumber for WhatsMinerV1 {}
+impl SupportsTimezoneConfig for WhatsMinerV1 {}
 impl GetHostname for WhatsMinerV1 {}
 impl GetApiVersion for WhatsMinerV1 {
     fn parse_api_version(&self, data: &HashMap<DataField, Value>) -> Option<String> {
@@ -311,9 +313,9 @@ impl GetHashboards for WhatsMinerV1 {
                     HashRate {
                         value: f,
                         unit: HashRateUnit::MegaHash,
-                        algo: "SHA256".to_string(),
+                        algo: self.device_info.algo,
                     }
-                    .as_unit(HashRateUnit::default())
+                    .as_default_unit()
                 });
             board.expected_hashrate = hashboard_data
                 .pointer(&format!("/DEVS/{idx}/Factory GHS"))
@@ -322,9 +324,9 @@ impl GetHashboards for WhatsMinerV1 {
                     HashRate {
                         value: f,
                         unit: HashRateUnit::GigaHash,
-                        algo: "SHA256".to_string(),
+                        algo: self.device_info.algo,
                     }
-                    .as_unit(HashRateUnit::default())
+                    .as_default_unit()
                 });
             board.board_temperature = hashboard_data
                 .pointer(&format!("/DEVS/{idx}/Temperature"))
@@ -368,9 +370,9 @@ impl GetHashrate for WhatsMinerV1 {
             HashRate {
                 value: f,
                 unit: HashRateUnit::MegaHash,
-                algo: "SHA256".to_string(),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default())
+            .as_default_unit()
         })
     }
 }
@@ -380,9 +382,9 @@ impl GetExpectedHashrate for WhatsMinerV1 {
             HashRate {
                 value: f,
                 unit: HashRateUnit::GigaHash,
-                algo: "SHA256".to_string(),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default())
+            .as_default_unit()
         })
     }
 }
@@ -419,6 +421,7 @@ impl GetPsuFans for WhatsMinerV1 {
         psu_fans
     }
 }
+impl GetPsus for WhatsMinerV1 {}
 impl GetFluidTemperature for WhatsMinerV1 {
     fn parse_fluid_temperature(&self, data: &HashMap<DataField, Value>) -> Option<Temperature> {
         data.extract_map::<f64, _>(DataField::FluidTemperature, Temperature::from_celsius)
@@ -474,6 +477,13 @@ impl GetUptime for WhatsMinerV1 {
         data.extract_map::<u64, _>(DataField::Uptime, Duration::from_secs)
     }
 }
+
+impl GetBestShare for WhatsMinerV1 {}
+impl GetSessionBestShare for WhatsMinerV1 {}
+impl GetOperatingState for WhatsMinerV1 {}
+
+impl GetDevFeeConnected for WhatsMinerV1 {}
+
 impl GetIsMining for WhatsMinerV1 {
     fn parse_is_mining(&self, data: &HashMap<DataField, Value>) -> bool {
         // btmineroff: "true" means mining is OFF
@@ -517,11 +527,16 @@ impl GetPools for WhatsMinerV1 {
                     .and_then(|val| val.pointer(&format!("/{}/Rejected", idx)))
                     .and_then(|val| val.as_u64());
 
+                let last_share_time = pools_raw
+                    .and_then(|val| val.pointer(&format!("/{}/Last Share Time", idx)))
+                    .and_then(asic_rs_core::util::parse_last_share_time);
+
                 pools.push(PoolData {
                     position: Some(idx as u16),
                     url,
                     accepted_shares,
                     rejected_shares,
+                    last_share_time,
                     active,
                     alive,
                     user,
@@ -604,6 +619,9 @@ impl FactoryReset for WhatsMinerV1 {
         false
     }
 }
+
+impl RestartMining for WhatsMinerV1 {}
+impl RestoreStockOs for WhatsMinerV1 {}
 
 #[async_trait]
 impl SupportsScalingConfig for WhatsMinerV1 {
@@ -738,7 +756,7 @@ mod integration_tests {
             Some(HashRate {
                 value: 67.39480097,
                 unit: HashRateUnit::TeraHash,
-                algo: "SHA256".to_string(),
+                algo: HashAlgorithm::SHA256,
             })
         );
         assert_eq!(
@@ -746,7 +764,7 @@ mod integration_tests {
             Some(HashRate {
                 value: 68.796,
                 unit: HashRateUnit::TeraHash,
-                algo: "SHA256".to_string(),
+                algo: HashAlgorithm::SHA256,
             })
         );
         assert_eq!(miner_data.wattage, Some(Power::from_watts(3417f64)));
@@ -758,6 +776,11 @@ mod integration_tests {
         assert!(miner_data.is_mining);
         assert_eq!(miner_data.fans.len(), 2);
         assert_eq!(miner_data.pools[0].len(), 3);
+        assert_eq!(
+            miner_data.pools[0].pools[0].last_share_time,
+            Some(1_761_061_364)
+        );
+        assert_eq!(miner_data.pools[0].pools[1].last_share_time, None);
 
         Ok(())
     }
@@ -839,4 +862,7 @@ mod integration_tests {
 
 impl SupportsTemperatureConfig for WhatsMinerV1 {}
 impl GetTuningPercent for WhatsMinerV1 {}
+impl SetHashboardsEnabled for WhatsMinerV1 {}
+
 impl SetTuningPercent for WhatsMinerV1 {}
+impl SupportsPresets for WhatsMinerV1 {}

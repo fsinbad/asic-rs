@@ -1,9 +1,9 @@
 use std::{fmt, fmt::Display, net::IpAddr};
 
-use asic_rs_core::data::device::MinerHardware;
-use asic_rs_core::traits::model::UnknownMinerModel;
+use asic_rs_core::data::device::{HashAlgorithm, MinerHardware};
+use asic_rs_core::traits::model::{MinerModelAlgorithm, UnknownMinerModel};
 use asic_rs_core::{
-    data::command::MinerCommand,
+    data::command::DiscoveryCommand,
     discovery::{HTTP_WEB_ROOT, RPC_VERSION},
     errors::ModelSelectionError,
     traits::{
@@ -15,14 +15,14 @@ use asic_rs_core::{
         miner::{HasDefaultAuth, Miner, MinerAuth, MinerConstructor},
         model::MinerModel,
     },
-    util::build_discovery_client,
+    util::{build_discovery_client, send_rpc_command},
 };
 use asic_rs_makes_antminer::make::AntMinerMake;
 use asic_rs_makes_antminer::models::AntMinerModel;
 use async_trait::async_trait;
 use chrono::{Datelike, NaiveDateTime};
 use diqwest::WithDigestAuth;
-use reqwest::Response;
+use reqwest::{Response, StatusCode};
 use serde_json::Value;
 
 #[derive(Clone)]
@@ -64,6 +64,15 @@ impl MinerModel for AntMinerCompatibleModel {
     }
 }
 
+impl MinerModelAlgorithm for AntMinerCompatibleModel {
+    fn hash_algorithm(&self) -> HashAlgorithm {
+        match self {
+            Self::AntMiner(m) => m.hash_algorithm(),
+            Self::Unknown(m) => m.hash_algorithm(),
+        }
+    }
+}
+
 #[derive(Default, Debug)]
 pub struct AntMinerStockFirmware {}
 
@@ -74,9 +83,68 @@ impl Display for AntMinerStockFirmware {
 }
 
 impl DiscoveryCommands for AntMinerStockFirmware {
-    fn get_discovery_commands(&self) -> Vec<MinerCommand> {
+    fn get_discovery_commands(&self) -> Vec<DiscoveryCommand> {
         vec![RPC_VERSION, HTTP_WEB_ROOT]
     }
+}
+
+fn parse_model_response(
+    json_data: Value,
+    model_key: &str,
+) -> Result<AntMinerCompatibleModel, ModelSelectionError> {
+    let model = json_data[model_key].as_str().unwrap_or("").to_uppercase();
+
+    // When stock firmware cannot name the product it reports the hashboard
+    // part name as the model (for example "Antminer BHB68701"). Some builds
+    // still carry the real product in `product_type`, so prefer it only when
+    // the model field itself is not a known model.
+    if !AntMinerMake::parse_model(model.clone()).is_ok_and(|m| m.is_known())
+        && let Some(product) = json_data["product_type"].as_str()
+        && let Ok(product_model) = AntMinerMake::parse_model(product.to_uppercase())
+        && product_model.is_known()
+    {
+        return Ok(AntMinerCompatibleModel::AntMiner(product_model));
+    }
+
+    if model == "ANTMINER BHB42XXX" {
+        Ok(AntMinerCompatibleModel::Unknown(UnknownMinerModel {
+            name: model,
+        }))
+    } else {
+        AntMinerMake::parse_model(model).map(AntMinerCompatibleModel::AntMiner)
+    }
+}
+
+fn parse_rpc_model(data: &Value) -> Result<AntMinerCompatibleModel, ModelSelectionError> {
+    let info = data["VERSION"]
+        .as_array()
+        .and_then(|rows| rows.first())
+        .ok_or(ModelSelectionError::UnexpectedModelResponse)?;
+    let model = info["Type"]
+        .as_str()
+        .filter(|name| !name.trim().is_empty())
+        .ok_or(ModelSelectionError::UnexpectedModelResponse)?;
+    parse_model_response(serde_json::json!({"miner_type": model}), "miner_type")
+}
+
+/// Fetch the model using unauthenticated RPC when web access fails.
+async fn get_model_with_rpc(ip: IpAddr) -> Result<AntMinerCompatibleModel, ModelSelectionError> {
+    let data = send_rpc_command(&ip, "version")
+        .await
+        .ok_or(ModelSelectionError::NoModelResponse)?;
+    parse_rpc_model(&data)
+}
+
+fn parse_rpc_version(data: &Value) -> Option<semver::Version> {
+    data["VERSION"][0]["CompileTime"]
+        .as_str()
+        .and_then(parse_version_date)
+}
+
+/// Fetch the firmware version using unauthenticated RPC when web access fails.
+async fn get_version_with_rpc(ip: IpAddr) -> Option<semver::Version> {
+    let data = send_rpc_command(&ip, "version").await?;
+    parse_rpc_version(&data)
 }
 
 /// Fetch the model from a miner using digest auth.
@@ -90,41 +158,35 @@ async fn get_model_with_auth(
         .send_digest_auth((auth.username(), auth.password()))
         .await
         .ok();
-    match response {
-        Some(data) => {
-            let Ok(json_data) = data.json::<Value>().await else {
-                return Err(ModelSelectionError::UnexpectedModelResponse);
-            };
 
-            let model = json_data["miner_type"]
-                .as_str()
-                .unwrap_or("")
-                .to_uppercase();
+    let Some(response) = response else {
+        return Err(ModelSelectionError::NoModelResponse);
+    };
 
-            if model == "ANTMINER BHB42XXX" {
-                Ok(AntMinerCompatibleModel::Unknown(UnknownMinerModel {
-                    name: model,
-                }))
-            } else {
-                AntMinerMake::parse_model(model).map(AntMinerCompatibleModel::AntMiner)
-            }
-        }
-        None => Err(ModelSelectionError::NoModelResponse),
+    let (response, model_key) = if response.status() == StatusCode::NOT_FOUND {
+        let fallback_response: Option<Response> = client
+            .get(format!("http://{ip}/cgi-bin/get_system_info.cgi"))
+            .send_digest_auth((auth.username(), auth.password()))
+            .await
+            .ok();
+
+        let Some(response) = fallback_response else {
+            return Err(ModelSelectionError::NoModelResponse);
+        };
+
+        (response, "minertype")
+    } else {
+        (response, "miner_type")
+    };
+
+    if let Ok(json_data) = response.json::<Value>().await {
+        parse_model_response(json_data, model_key)
+    } else {
+        Err(ModelSelectionError::UnexpectedModelResponse)
     }
 }
 
-/// Fetch the firmware version from a miner using digest auth.
-async fn get_version_with_auth(ip: IpAddr, auth: &MinerAuth) -> Option<semver::Version> {
-    let client = build_discovery_client().ok()?;
-    let data: Response = client
-        .get(format!("http://{ip}/cgi-bin/summary.cgi"))
-        .send_digest_auth((auth.username(), auth.password()))
-        .await
-        .ok()?;
-
-    let json_data = data.json::<serde_json::Value>().await.ok()?;
-    let fw_version = json_data["INFO"]["CompileTime"].as_str().unwrap_or("");
-
+fn parse_version_date(fw_version: &str) -> Option<semver::Version> {
     let cleaned: String = {
         let mut parts: Vec<&str> = fw_version.split_whitespace().collect();
         if parts.len() > 4 {
@@ -142,18 +204,54 @@ async fn get_version_with_auth(ip: IpAddr, auth: &MinerAuth) -> Option<semver::V
     ))
 }
 
+/// Fetch the firmware version from a miner using digest auth.
+async fn get_version_with_auth(ip: IpAddr, auth: &MinerAuth) -> Option<semver::Version> {
+    let client = build_discovery_client().ok()?;
+    if let Ok(response) = client
+        .get(format!("http://{ip}/cgi-bin/summary.cgi"))
+        .send_digest_auth((auth.username(), auth.password()))
+        .await
+        && let Ok(data) = response.json::<Value>().await
+        && let Some(version) = data["INFO"]["CompileTime"]
+            .as_str()
+            .and_then(parse_version_date)
+    {
+        return Some(version);
+    }
+
+    // Older stock firmware (including Z15) has no summary.cgi, but reports
+    // the build date through get_system_info.cgi.
+    let response: Response = client
+        .get(format!("http://{ip}/cgi-bin/get_system_info.cgi"))
+        .send_digest_auth((auth.username(), auth.password()))
+        .await
+        .ok()?;
+    let data = response.json::<Value>().await.ok()?;
+    data["system_filesystem_version"]
+        .as_str()
+        .and_then(parse_version_date)
+}
+
 #[async_trait]
 impl MinerFirmware for AntMinerStockFirmware {
-    /// Uses default credentials. For custom credentials, use `build_miner`
-    /// which passes auth through to the underlying digest-auth requests.
-    async fn get_model(ip: IpAddr) -> Result<impl MinerModel + Send, ModelSelectionError> {
+    type Model = AntMinerCompatibleModel;
+
+    /// Uses default web credentials, falling back to unauthenticated RPC.
+    /// For custom web credentials, use `build_miner`.
+    async fn get_model(ip: IpAddr) -> Result<Self::Model, ModelSelectionError> {
         let default = crate::backends::v2020::AntMinerV2020::default_auth();
-        get_model_with_auth(ip, &default).await
+        match get_model_with_auth(ip, &default).await {
+            Ok(model) => Ok(model),
+            Err(_) => get_model_with_rpc(ip).await,
+        }
     }
 
     async fn get_version(ip: IpAddr) -> Option<semver::Version> {
         let default = crate::backends::v2020::AntMinerV2020::default_auth();
-        get_version_with_auth(ip, &default).await
+        match get_version_with_auth(ip, &default).await {
+            Some(version) => Some(version),
+            None => get_version_with_rpc(ip).await,
+        }
     }
 }
 
@@ -180,12 +278,198 @@ impl FirmwareEntry for AntMinerStockFirmware {
     ) -> Result<Box<dyn Miner>, ModelSelectionError> {
         let default = crate::backends::v2020::AntMinerV2020::default_auth();
         let resolved = auth.unwrap_or(&default);
-        let model = get_model_with_auth(ip, resolved).await?;
-        let version = get_version_with_auth(ip, resolved).await;
+        // Prefer web identity: some models need its product_type override.
+        let model = match get_model_with_auth(ip, resolved).await {
+            Ok(model) => model,
+            Err(_) => get_model_with_rpc(ip).await?,
+        };
+        let version = match get_version_with_auth(ip, resolved).await {
+            Some(version) => Some(version),
+            None => get_version_with_rpc(ip).await,
+        };
         let mut miner = crate::backends::AntMiner::new(ip, model, version);
         if let Some(auth) = auth {
             miner.set_auth(auth.clone());
         }
         Ok(miner)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{net::IpAddr, str::FromStr, sync::Arc};
+
+    use anyhow::Context;
+    use asic_rs_core::data::command::MinerCommand;
+    use asic_rs_core::test::util::get_miner;
+    use asic_rs_core::traits::miner::Validate;
+    use asic_rs_makes_antminer::models::AntMinerModel;
+
+    use super::*;
+
+    #[test]
+    fn legacy_system_info_date_selects_v2018_backend() {
+        let version = parse_version_date("Fri Jul 3 11:39:06 CST 2020").unwrap();
+        assert_eq!(version, semver::Version::new(2020, 7, 3));
+        assert!(crate::backends::v2018::AntMinerV2018::validate(Some(
+            &version
+        )));
+
+        assert!(parse_version_date("FR-1.12(251009-S21)").is_none());
+    }
+
+    /// Live model detection always yields an [`AntMinerCompatibleModel`], never
+    /// a bare [`AntMinerModel`]. When this wrapper failed to forward
+    /// `hash_algorithm` every miner reported SHA-256 on real hardware while the
+    /// make-level tests passed, so the forwarding is asserted here directly.
+    #[test]
+    fn wrapper_forwards_hash_algorithm() {
+        assert_eq!(
+            AntMinerCompatibleModel::AntMiner(AntMinerModel::L9).hash_algorithm(),
+            HashAlgorithm::Scrypt
+        );
+        assert_eq!(
+            AntMinerCompatibleModel::AntMiner(AntMinerModel::L11).hash_algorithm(),
+            HashAlgorithm::Scrypt
+        );
+        assert_eq!(
+            AntMinerCompatibleModel::AntMiner(AntMinerModel::S21).hash_algorithm(),
+            HashAlgorithm::SHA256
+        );
+        assert_eq!(
+            AntMinerCompatibleModel::Unknown(UnknownMinerModel {
+                name: "ANTMINER S99".to_string(),
+            })
+            .hash_algorithm(),
+            HashAlgorithm::Unknown
+        );
+    }
+
+    /// Response captured from a T21 on factory firmware: the model field holds
+    /// the hashboard part name and only `product_type` names the product.
+    #[test]
+    fn board_name_model_falls_back_to_product_type() {
+        let response = serde_json::json!({
+            "miner_type": "Antminer BHB68701",
+            "subtype": "AMLCtrl_BHB6870X",
+            "fw_version": "Thu Mar 28 17:39:26 CST 2024",
+            "product_type": "Antminer T21"
+        });
+
+        let model = parse_model_response(response, "miner_type").unwrap();
+
+        assert!(matches!(
+            model,
+            AntMinerCompatibleModel::AntMiner(AntMinerModel::T21)
+        ));
+        let hardware = MinerHardware::from(model);
+        assert_eq!(hardware.fans, Some(4));
+        assert_eq!(hardware.boards, Some(vec![Some(108); 3]));
+    }
+
+    #[test]
+    fn known_model_ignores_product_type() {
+        let response = serde_json::json!({
+            "miner_type": "Antminer S21",
+            "product_type": "Antminer T21"
+        });
+
+        let model = parse_model_response(response, "miner_type").unwrap();
+
+        assert!(matches!(
+            model,
+            AntMinerCompatibleModel::AntMiner(AntMinerModel::S21)
+        ));
+    }
+
+    /// Without a usable `product_type` a board name stays unrecognised.
+    #[test]
+    fn board_name_model_without_product_type_stays_unknown() {
+        for response in [
+            serde_json::json!({
+                "miner_type": "Antminer H6HB70701",
+                "subtype": "zynq7007_H6HB70701",
+                "fw_version": "Mon Jan  6 15:35:28 CST 2025"
+            }),
+            serde_json::json!({
+                "miner_type": "Antminer HHB68XXX",
+                "subtype": "zynq7007_HHB68XXX",
+                "product_type": "Antminer HHB68XXX"
+            }),
+            serde_json::json!({
+                "miner_type": "Antminer BHB42XXX",
+                "subtype": "AMLCtrl_BHB42XXX"
+            }),
+        ] {
+            let model = parse_model_response(response, "miner_type").unwrap();
+
+            assert!(!model.is_known(), "{model}");
+            assert_eq!(MinerHardware::from(model).boards, None);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live miner; requests sleep mode and leaves it paused on success; set MINER_IP"]
+    async fn pause_live_test_auto_detect() -> anyhow::Result<()> {
+        let ip_str = std::env::var("MINER_IP").context("MINER_IP is not set")?;
+        let ip =
+            IpAddr::from_str(&ip_str).with_context(|| format!("invalid MINER_IP: {ip_str}"))?;
+
+        let miner = get_miner(ip, Arc::new(AntMinerStockFirmware::default()))
+            .await?
+            .context("no miner detected at MINER_IP")?;
+
+        let pause_result = miner.pause(None).await;
+        println!("pause_success={}", matches!(&pause_result, Ok(true)));
+
+        let miner_data = miner.get_data().await;
+        println!(
+            "hashrate_after_pause_request={}",
+            serde_json::to_string(&miner_data.hashrate)?
+        );
+        let summary_command = MinerCommand::RPC {
+            command: "summary",
+            parameters: None,
+        };
+        match miner.get_api_result(&summary_command).await {
+            Ok(summary) => {
+                let rate = summary
+                    .get("SUMMARY")
+                    .and_then(|rows| rows.get(0))
+                    .map(|row| {
+                        let mut rate_fields = serde_json::Map::new();
+                        for key in [
+                            "rate_5s",
+                            "rate_avg",
+                            "rate_unit",
+                            "MHS 5s",
+                            "MHS av",
+                            "GHS 5s",
+                            "GHS av",
+                        ] {
+                            if let Some(value) = row.get(key) {
+                                rate_fields.insert(key.to_string(), value.clone());
+                            }
+                        }
+                        serde_json::Value::Object(rate_fields)
+                    })
+                    .unwrap_or(serde_json::Value::Null);
+                println!(
+                    "raw_summary_hashrate_after_pause_request={}",
+                    serde_json::to_string(&rate)?
+                );
+            }
+            Err(error) => println!("raw_summary_error={error:#}"),
+        }
+        println!("is_mining_after_pause={}", miner_data.is_mining);
+        println!(
+            "operating_state_after_pause={:?}",
+            miner_data.operating_state
+        );
+
+        let paused = pause_result?;
+        anyhow::ensure!(paused, "miner did not confirm pause/sleep");
+
+        Ok(())
     }
 }

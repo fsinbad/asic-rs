@@ -63,7 +63,8 @@ impl APIClient for AvalonAMiner {
         match command {
             MinerCommand::RPC { .. } => self.rpc.get_api_result(command).await,
             _ => Err(anyhow::anyhow!(
-                "Unsupported command type for AvalonMiner API"
+                "Unsupported command type for {} API",
+                AvalonStockFirmware::default()
             )),
         }
     }
@@ -183,6 +184,9 @@ impl FactoryReset for AvalonAMiner {
         false
     }
 }
+
+impl RestartMining for AvalonAMiner {}
+impl RestoreStockOs for AvalonAMiner {}
 
 #[async_trait]
 impl SetFaultLight for AvalonAMiner {
@@ -412,6 +416,14 @@ impl GetDataLocations for AvalonAMiner {
                         tag: Some("ps"),
                     },
                 ),
+                (
+                    RPC_STATS,
+                    DataExtractor {
+                        func: get_by_pointer,
+                        key: Some("/STATS/0/MM ID0/WALLPOWER"),
+                        tag: None,
+                    },
+                ),
             ],
             DataField::TuningTarget => vec![
                 (
@@ -427,6 +439,14 @@ impl GetDataLocations for AvalonAMiner {
                     DataExtractor {
                         func: get_by_pointer,
                         key: Some("/STATS/0/MM ID0:Summary/STATS/MPO"),
+                        tag: None,
+                    },
+                ),
+                (
+                    RPC_STATS,
+                    DataExtractor {
+                        func: get_by_pointer,
+                        key: Some("/STATS/0/MM ID0/MPO"),
                         tag: None,
                     },
                 ),
@@ -473,6 +493,17 @@ impl GetDataLocations for AvalonAMiner {
                     tag: None,
                 },
             )],
+            DataField::SessionBestShare => vec![(
+                MinerCommand::RPC {
+                    command: "summary",
+                    parameters: None,
+                },
+                DataExtractor {
+                    func: get_by_pointer,
+                    key: Some("/SUMMARY/0/Best Share"),
+                    tag: None,
+                },
+            )],
             DataField::Uptime => vec![(
                 RPC_STATS,
                 DataExtractor {
@@ -481,14 +512,24 @@ impl GetDataLocations for AvalonAMiner {
                     tag: None,
                 },
             )],
-            DataField::Pools => vec![(
-                RPC_POOLS,
-                DataExtractor {
-                    func: get_by_pointer,
-                    key: Some("/POOLS"),
-                    tag: None,
-                },
-            )],
+            DataField::Pools => vec![
+                (
+                    RPC_POOLS,
+                    DataExtractor {
+                        func: get_by_pointer,
+                        key: Some("/POOLS"),
+                        tag: Some("pools"),
+                    },
+                ),
+                (
+                    RPC_STATS,
+                    DataExtractor {
+                        func: get_by_pointer,
+                        key: Some("/STATS/0/Elapsed"),
+                        tag: Some("elapsed"),
+                    },
+                ),
+            ],
             _ => vec![],
         }
     }
@@ -553,6 +594,7 @@ impl GetControlBoardVersion for AvalonAMiner {
 }
 
 impl GetHostname for AvalonAMiner {}
+impl SupportsTimezoneConfig for AvalonAMiner {}
 
 impl GetApiVersion for AvalonAMiner {
     fn parse_api_version(&self, data: &HashMap<DataField, Value>) -> Option<String> {
@@ -604,9 +646,9 @@ impl GetHashboards for AvalonAMiner {
                     HashRate {
                         value: rate,
                         unit: HashRateUnit::GigaHash,
-                        algo: "SHA256".to_string(),
+                        algo: self.device_info.algo,
                     }
-                    .as_unit(HashRateUnit::default())
+                    .as_default_unit()
                 });
 
                 board.board_temperature =
@@ -714,9 +756,9 @@ impl GetHashboards for AvalonAMiner {
                 HashRate {
                     value: r,
                     unit: HashRateUnit::GigaHash,
-                    algo: "SHA256".to_string(),
+                    algo: self.device_info.algo,
                 }
-                .as_unit(HashRateUnit::default())
+                .as_default_unit()
             });
 
             board.board_temperature =
@@ -803,9 +845,9 @@ impl GetHashrate for AvalonAMiner {
             HashRate {
                 value: f,
                 unit: HashRateUnit::MegaHash,
-                algo: "SHA256".to_string(),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default())
+            .as_default_unit()
         })
     }
 }
@@ -816,9 +858,9 @@ impl GetExpectedHashrate for AvalonAMiner {
             HashRate {
                 value: f,
                 unit: HashRateUnit::GigaHash,
-                algo: "SHA256".to_string(),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default())
+            .as_default_unit()
         })
     }
 }
@@ -853,6 +895,7 @@ impl GetFans for AvalonAMiner {
 }
 
 impl GetPsuFans for AvalonAMiner {}
+impl GetPsus for AvalonAMiner {}
 
 impl GetWattage for AvalonAMiner {
     fn parse_wattage(&self, data: &HashMap<DataField, Value>) -> Option<Power> {
@@ -916,6 +959,13 @@ impl GetUptime for AvalonAMiner {
     }
 }
 
+impl GetBestShare for AvalonAMiner {}
+impl GetSessionBestShare for AvalonAMiner {
+    fn parse_session_best_share(&self, data: &HashMap<DataField, Value>) -> Option<f64> {
+        data.extract::<f64>(DataField::SessionBestShare)
+    }
+}
+
 impl GetFluidTemperature for AvalonAMiner {
     fn parse_fluid_temperature(&self, data: &HashMap<DataField, Value>) -> Option<Temperature> {
         data.extract_map::<f64, _>(DataField::FluidTemperature, Temperature::from_celsius)
@@ -928,13 +978,20 @@ impl GetFluidTemperature for AvalonAMiner {
         data.extract_map::<f64, _>(DataField::OutletFluidTemperature, Temperature::from_celsius)
     }
 }
+impl GetOperatingState for AvalonAMiner {}
+
+impl GetDevFeeConnected for AvalonAMiner {}
+
 impl GetIsMining for AvalonAMiner {}
 
 impl GetPools for AvalonAMiner {
     fn parse_pools(&self, data: &HashMap<DataField, Value>) -> Vec<PoolGroupData> {
-        let pools = data
-            .get(&DataField::Pools)
-            .and_then(|v| v.as_array())
+        let pools_data = data.get(&DataField::Pools);
+        let elapsed = pools_data
+            .and_then(|value| value.get("elapsed"))
+            .and_then(Value::as_u64);
+        let pools = pools_data
+            .and_then(|value| value.get("pools").unwrap_or(value).as_array())
             .map(|slice| slice.to_vec())
             .unwrap_or_default()
             .into_iter()
@@ -953,6 +1010,7 @@ impl GetPools for AvalonAMiner {
                 active: pool.get("Stratum Active").and_then(|v| v.as_bool()),
                 accepted_shares: pool.get("Accepted").and_then(|v| v.as_u64()),
                 rejected_shares: pool.get("Rejected").and_then(|v| v.as_u64()),
+                last_share_time: super::parse_last_share_time(&pool, elapsed),
             })
             .collect();
 
@@ -1001,7 +1059,11 @@ impl SupportsFanConfig for AvalonAMiner {
 
 impl SupportsTemperatureConfig for AvalonAMiner {}
 impl GetTuningPercent for AvalonAMiner {}
+impl SetHashboardsEnabled for AvalonAMiner {}
+
 impl SetTuningPercent for AvalonAMiner {}
+
+impl SupportsPresets for AvalonAMiner {}
 
 #[cfg(test)]
 mod tests {
@@ -1011,7 +1073,40 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::test::json::{AVALON_A_STATS_PARSED, PARSED_STATS_COMMAND};
+    use crate::test::json::{AVALON_A_STATS_PARSED, PARSED_STATS_COMMAND, POOLS_COMMAND};
+
+    #[tokio::test]
+    async fn pools_include_session_relative_last_share_time() -> anyhow::Result<()> {
+        let miner = AvalonAMiner::new(IpAddr::from([127, 0, 0, 1]), AvalonMinerModel::Avalon1566Ha);
+        let results = HashMap::from([
+            (
+                MinerCommand::RPC {
+                    command: "stats",
+                    parameters: None,
+                },
+                Value::from_str(PARSED_STATS_COMMAND)?,
+            ),
+            (
+                MinerCommand::RPC {
+                    command: "pools",
+                    parameters: None,
+                },
+                Value::from_str(POOLS_COMMAND)?,
+            ),
+        ]);
+        let mock_api = MockAPIClient::new(results);
+        let mut collector = DataCollector::new_with_client(&miner, &mock_api);
+        let data = collector.collect(&[DataField::Pools]).await;
+        let collected_at = asic_rs_core::util::unix_timestamp_secs();
+
+        let pools = miner.parse_pools(&data);
+        let last_share_time = pools[0].pools[0]
+            .last_share_time
+            .ok_or_else(|| anyhow::anyhow!("missing last share time"))?;
+
+        assert!(last_share_time.abs_diff(collected_at - (37_819 - 31_279)) <= 1);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_avalon_a_summary_format_hashboards() -> anyhow::Result<()> {
@@ -1129,7 +1224,7 @@ mod tests {
             Some(HashRate {
                 value: 83.92304,
                 unit: HashRateUnit::TeraHash,
-                algo: "SHA256".to_string()
+                algo: HashAlgorithm::SHA256
             })
         );
         assert_eq!(miner_data.wattage, Some(Power::from_watts(3189.0)));

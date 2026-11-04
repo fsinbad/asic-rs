@@ -9,6 +9,8 @@ use reqwest::{Client, Method, Response};
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
 
+use crate::backends::is_public_read_endpoint;
+
 /// VNish WebAPI client
 #[derive(Debug)]
 pub struct VnishWebAPI {
@@ -42,16 +44,19 @@ impl WebAPIClient for VnishWebAPI {
     async fn send_command(
         &self,
         command: &str,
-        _privileged: bool,
+        privileged: bool,
         parameters: Option<Value>,
         method: Method,
     ) -> anyhow::Result<Value> {
-        // Ensure we're authenticated before making the request
-        if let Err(e) = self.ensure_authenticated().await {
-            return Err(anyhow::anyhow!("Failed to authenticate: {}", e));
-        }
-
         let url = format!("http://{}:{}/api/v1/{}", self.ip, self.port, command);
+
+        // Only skip eager authentication for read endpoints confirmed to be
+        // public. Unknown or privileged requests authenticate before sending.
+        if privileged || !is_public_read_endpoint(command, &method) {
+            self.ensure_authenticated()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to authenticate: {}", e))?;
+        }
 
         let mut response = self
             .execute_request(&url, &method, parameters.clone())
@@ -71,10 +76,12 @@ impl WebAPIClient for VnishWebAPI {
                 .map_err(|e| VnishError::ParseError(e.to_string()))?;
             Ok(json_data)
         } else {
+            // The API reports why it rejected a request in the body.
             let code = status.as_u16();
+            let body = response.text().await.unwrap_or_default();
             Err(match code {
                 401 => VnishError::Unauthorized,
-                _ => VnishError::HttpError(code),
+                _ => VnishError::HttpError { status: code, body },
             })?
         }
     }
@@ -223,7 +230,9 @@ impl VnishWebAPI {
                 .map_err(|e| VnishError::ParseError(e.to_string()))?;
             Ok(json_data)
         } else {
-            Err(VnishError::HttpError(status.as_u16()))?
+            let status = status.as_u16();
+            let body = response.text().await.unwrap_or_default();
+            Err(VnishError::HttpError { status, body })?
         }
     }
 
@@ -270,6 +279,43 @@ impl VnishWebAPI {
             .await
     }
 
+    /// Restart the mining program without rebooting the miner.
+    ///
+    /// The request is sent directly rather than through `send_command` so an
+    /// empty success body is accepted and a rejection keeps the firmware's text.
+    pub async fn restart_mining(&self) -> anyhow::Result<()> {
+        self.ensure_authenticated().await?;
+
+        let url = format!("http://{}:{}/api/v1/mining/restart", self.ip, self.port);
+        let mut response = self.execute_request(&url, &Method::POST, None).await?;
+
+        if response.status().as_u16() == 401 {
+            *self.bearer_token.write().await = None;
+            self.ensure_authenticated().await?;
+            response = self.execute_request(&url, &Method::POST, None).await?;
+        }
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| VnishError::ParseError(e.to_string()))?;
+
+        if !status.is_success() {
+            anyhow::bail!("VNish mining restart request failed with status code {status}: {body}");
+        }
+
+        // The documented 200 response has no body; older builds answer with a
+        // JSON object carrying a `success` flag.
+        if let Ok(json) = serde_json::from_str::<Value>(&body)
+            && json.get("success").and_then(Value::as_bool) == Some(false)
+        {
+            anyhow::bail!("VNish mining restart request failed: {body}");
+        }
+
+        Ok(())
+    }
+
     pub async fn change_password(&self, password: &str) -> anyhow::Result<bool> {
         let settings = json!({
             "password": {
@@ -287,6 +333,32 @@ impl VnishWebAPI {
             .map(|_| true)
     }
 
+    /// Remove VNish and restore the manufacturer stock OS.
+    ///
+    /// VNish 1.3.x requires the stock-log choice in the request and reports
+    /// the delay before its background restore task reboots the miner.
+    pub async fn restore_stock_os(&self) -> anyhow::Result<u64> {
+        let response = self
+            .send_command(
+                "firmware/remove",
+                true,
+                Some(json!({ "remove_stock_logs": false })),
+                Method::POST,
+            )
+            .await?;
+
+        response
+            .get("after")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                VnishError::ParseError(
+                    "firmware/remove response is missing an unsigned integer 'after' field"
+                        .to_string(),
+                )
+                .into()
+            })
+    }
+
     async fn read_log(&self, log_type: &str) -> anyhow::Result<String> {
         self.ensure_authenticated().await?;
 
@@ -294,7 +366,9 @@ impl VnishWebAPI {
         let response = self.execute_request(&url, &Method::GET, None).await?;
         let status = response.status();
         if !status.is_success() {
-            Err(VnishError::HttpError(status.as_u16()))?;
+            let status = status.as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(VnishError::HttpError { status, body }.into());
         }
 
         response
@@ -325,8 +399,8 @@ impl VnishWebAPI {
 pub enum VnishError {
     /// Network error (connection issues, DNS resolution, etc.)
     NetworkError(String),
-    /// HTTP error with status code
-    HttpError(u16),
+    /// HTTP error with status code and response body
+    HttpError { status: u16, body: String },
     /// JSON parsing error
     ParseError(String),
     /// Request building error
@@ -347,7 +421,10 @@ impl std::fmt::Display for VnishError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VnishError::NetworkError(msg) => write!(f, "Network error: {msg}"),
-            VnishError::HttpError(code) => write!(f, "HTTP error: {code}"),
+            VnishError::HttpError { status, body } if !body.trim().is_empty() => {
+                write!(f, "HTTP error: {status}: {}", body.trim())
+            }
+            VnishError::HttpError { status, .. } => write!(f, "HTTP error: {status}"),
             VnishError::ParseError(msg) => write!(f, "Parse error: {msg}"),
             VnishError::RequestError(msg) => write!(f, "Request error: {msg}"),
             VnishError::Timeout => write!(f, "Request timeout"),

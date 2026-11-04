@@ -45,16 +45,19 @@ jobs:
           fi
 
           TAG="v${VERSION}"
-          if git rev-parse "$TAG" >/dev/null 2>&1; then
-            echo "Tag $TAG already exists" >&2
-            exit 1
-          fi
+          GO_TAG="go/v${VERSION}"
+          for release_tag in "$TAG" "$GO_TAG"; do
+            if git rev-parse --verify "refs/tags/${release_tag}" >/dev/null 2>&1; then
+              echo "Tag $release_tag already exists" >&2
+              exit 1
+            fi
+          done
 
           CURRENT_VERSION=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p}' Cargo.toml)
 
           sed -i '/^\[workspace\.package\]/,/^\[/{s/^version = ".*"/version = "'"$VERSION"'"/}' Cargo.toml
           sed -i '/^\[workspace\.dependencies\]/,/^\[/{s/version = "'"$CURRENT_VERSION"'"/version = "'"$VERSION"'"/g}' Cargo.toml
-          sed -i '/^\[project\]/,/^\[/{s/^version = ".*"/version = "'"$VERSION"'"/}' pyproject.toml
+          sed -i '/^\[project\]/,/^\[/{s/^version = ".*"/version = "'"$VERSION"'"/}' python/pyasic-rs/pyproject.toml
 
           declare -A CARGO_MANIFESTS=()
           CARGO_MANIFESTS["./Cargo.toml"]=1
@@ -81,7 +84,7 @@ jobs:
             codeberg.org/msrd0/cargo-doc2readme:nightly \
             cargo doc2readme --expand-macros
 
-          git add Cargo.toml pyproject.toml README.md
+          git add Cargo.toml python/pyasic-rs/pyproject.toml README.md
 
           while IFS= read -r -d '' lockfile; do
             git add "$lockfile"
@@ -104,8 +107,9 @@ jobs:
 
           git commit -m "chore(release): prepare for ${TAG}"
           git tag "$TAG"
-          git push origin "HEAD:${GITHUB_REF}"
-          git push origin "$TAG"
+          # Go versions for a module in the go/ subdirectory need a go/ tag prefix.
+          git tag "$GO_TAG"
+          git push --atomic origin "HEAD:${GITHUB_REF}" "$TAG" "$GO_TAG"
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
@@ -194,7 +198,8 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
+          working-directory: python/pyasic-rs
+          args: --release --out ../../dist --find-interpreter
           sccache: true
           manylinux: ${{ matrix.manylinux }}
 
@@ -216,8 +221,9 @@ jobs:
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
+          working-directory: python/pyasic-rs
           command: sdist
-          args: --out dist
+          args: --out ../../dist
 
       - name: Upload sdist
         uses: actions/upload-artifact@v6
@@ -235,12 +241,59 @@ jobs:
           ref: ${{ needs.prepare-release.outputs.tag }}
 
       - name: Install cargo-workspaces
-        run: cargo install cargo-workspaces --locked
+        run: cargo install cargo-workspaces --version 0.4.2 --locked
 
       - name: Publish crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo workspaces publish --from-git --yes --allow-dirty
+        run: |
+          set -euo pipefail
+
+          # Publishing the root manifest without an explicit package selects
+          # workspace.default-members. Generate the dependency-ordered plan,
+          # then select each package explicitly so the root crate is published
+          # as `asic-rs` rather than attempting to republish the default members.
+          publish_plan="$(cargo workspaces plan --skip-published)"
+
+          publish_log="$(mktemp)"
+          trap 'rm -f "$publish_log"' EXIT
+
+          published_any=false
+          while IFS= read -r crate; do
+            if [ -z "$crate" ]; then
+              continue
+            fi
+
+            if $published_any; then
+              sleep 15
+            fi
+
+            echo "::group::Publishing ${crate}"
+            retry_delay=60
+            for attempt in 1 2 3 4 5; do
+              if cargo publish --package "$crate" 2>&1 | tee "$publish_log"; then
+                break
+              else
+                publish_status=$?
+              fi
+
+              # Retry only registry rate limits; surface packaging, compilation,
+              # authentication, and other publishing failures immediately.
+              if [ "$attempt" -eq 5 ] || ! grep -Eq 'status 429|429 Too Many Requests' "$publish_log"; then
+                exit "$publish_status"
+              fi
+
+              echo "::warning::Rate limited publishing ${crate}; retrying in ${retry_delay}s (attempt ${attempt}/5)"
+              sleep "$retry_delay"
+              retry_delay=$((retry_delay * 2))
+            done
+            echo "::endgroup::"
+            published_any=true
+          done <<< "$publish_plan"
+
+          if ! $published_any; then
+            echo "All workspace crates are already published"
+          fi
 
   release:
     runs-on: ubuntu-24.04

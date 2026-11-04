@@ -1,6 +1,7 @@
 use std::{
     any::Any,
     collections::{HashMap, HashSet},
+    future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     panic::AssertUnwindSafe,
     pin::Pin,
@@ -11,13 +12,13 @@ use std::{
 
 use anyhow::Result;
 use asic_rs_core::{
-    data::command::MinerCommand,
+    data::command::DiscoveryCommand,
     traits::{
         entry::FirmwareEntry,
         identification::WebResponse,
         miner::{Miner, MinerAuth},
     },
-    util::{send_rpc_command, send_web_command},
+    util::{send_rpc_command_on_port, send_web_command_on_port},
 };
 use futures::{
     Stream, StreamExt,
@@ -27,11 +28,14 @@ use futures::{
 };
 use ipnet::IpNet;
 use rand::seq::SliceRandom;
-use tokio::{net::TcpStream, time::timeout};
+use tokio::{net::TcpSocket, sync::Semaphore, time::timeout};
 
 const IDENTIFICATION_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTIVITY_TIMEOUT: Duration = Duration::from_secs(1);
 const CONNECTIVITY_RETRIES: u32 = 3;
+const CONNECTIVITY_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+const MAX_CONNECTIVITY_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+const MINER_PORTS: [u16; 4] = [80, 4028, 4029, 8889];
 const NOFILE_PER_CONCURRENCY: u64 = 8;
 const MIN_NOFILE_LIMIT: u64 = 2048;
 
@@ -52,27 +56,121 @@ fn calculate_desired_nofile_limit(concurrency: usize) -> u64 {
 
 async fn check_port_open(ip: IpAddr, port: u16, connectivity_timeout: Duration) -> bool {
     let addr: SocketAddr = (ip, port).into();
-    let stream = match timeout(connectivity_timeout, TcpStream::connect(addr)).await {
-        Ok(Ok(stream)) => stream,
-        _ => return false,
+    let socket = match ip {
+        IpAddr::V4(_) => TcpSocket::new_v4(),
+        IpAddr::V6(_) => TcpSocket::new_v6(),
     };
-    let _ = stream.set_nodelay(true);
-    true
+    let socket = match socket {
+        Ok(socket) => socket,
+        Err(error) => {
+            tracing::warn!(%ip, port, %error, "cannot allocate discovery socket");
+            return false;
+        }
+    };
+
+    // Reachability probes exchange no application data. Reset these temporary
+    // connections on close instead of occupying local ports in TIME_WAIT.
+    // Set this before connecting so canceled port races also release their ports.
+    if let Err(error) = socket.set_zero_linger() {
+        tracing::debug!(%ip, port, %error, "cannot set zero linger on discovery socket");
+    }
+
+    match timeout(connectivity_timeout, socket.connect(addr)).await {
+        Ok(Ok(_stream)) => true,
+        Ok(Err(error)) => {
+            tracing::debug!(
+                %ip,
+                port,
+                %error,
+                os_error = ?error.raw_os_error(),
+                "TCP discovery probe failed"
+            );
+            false
+        }
+        Err(_) => {
+            tracing::debug!(%ip, port, "TCP discovery probe timed out");
+            false
+        }
+    }
+}
+
+async fn with_connectivity_permit<Fut>(permits: Arc<Semaphore>, probe: Fut) -> bool
+where
+    Fut: Future<Output = bool>,
+{
+    let Ok(_permit) = permits.acquire_owned().await else {
+        return false;
+    };
+    probe.await
+}
+
+async fn race_miner_ports<F, Fut>(mut probe: F) -> bool
+where
+    F: FnMut(u16) -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let mut probes = FuturesUnordered::new();
+    for port in MINER_PORTS {
+        probes.push(probe(port));
+    }
+    while let Some(open) = probes.next().await {
+        if open {
+            return true;
+        }
+    }
+    false
+}
+
+async fn check_miner_ports(
+    ip: IpAddr,
+    connectivity_timeout: Duration,
+    permits: Arc<Semaphore>,
+) -> bool {
+    race_miner_ports(|port| {
+        with_connectivity_permit(
+            Arc::clone(&permits),
+            check_port_open(ip, port, connectivity_timeout),
+        )
+    })
+    .await
+}
+
+fn connectivity_retry_delay(retry_index: u32, initial_backoff: Duration) -> Duration {
+    let multiplier = 1_u32 << retry_index.min(31);
+    initial_backoff
+        .saturating_mul(multiplier)
+        .min(MAX_CONNECTIVITY_RETRY_BACKOFF)
+}
+
+async fn retry_connectivity<F, Fut>(retries: u32, initial_backoff: Duration, mut probe: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    for attempt in 0..=retries {
+        if attempt > 0 {
+            tokio::time::sleep(connectivity_retry_delay(attempt - 1, initial_backoff)).await;
+        }
+        if probe().await {
+            return true;
+        }
+    }
+    false
 }
 
 async fn get_miner_type_from_command(
     ip: IpAddr,
-    command: MinerCommand,
+    command: DiscoveryCommand,
     registry: Arc<[Arc<dyn FirmwareEntry>]>,
 ) -> Option<Arc<dyn FirmwareEntry>> {
     match command {
-        MinerCommand::RPC { command, .. } => {
-            let response = send_rpc_command(&ip, command).await?;
+        DiscoveryCommand::RPC { command, port } => {
+            let response = send_rpc_command_on_port(&ip, command, port).await?;
             let upper = response.to_string().to_uppercase();
             registry.iter().find(|fw| fw.identify_rpc(&upper)).cloned()
         }
-        MinerCommand::WebAPI { command, .. } => {
-            let (body, headers, status) = send_web_command(&ip, command).await?;
+        DiscoveryCommand::Web { command, port } => {
+            let (body, headers, status) = send_web_command_on_port(&ip, command, port).await?;
             let auth_header = headers
                 .get("www-authenticate")
                 .and_then(|h| h.to_str().ok())
@@ -97,7 +195,6 @@ async fn get_miner_type_from_command(
                 .find(|fw| fw.identify_web(&web_resp))
                 .cloned()
         }
-        _ => None,
     }
 }
 
@@ -113,7 +210,7 @@ fn panic_message(panic_info: &(dyn Any + Send)) -> &str {
 
 async fn get_miner_type_from_command_catch_unwind(
     ip: IpAddr,
-    command: MinerCommand,
+    command: DiscoveryCommand,
     registry: Arc<[Arc<dyn FirmwareEntry>]>,
 ) -> Option<Arc<dyn FirmwareEntry>> {
     match AssertUnwindSafe(get_miner_type_from_command(ip, command, registry))
@@ -137,6 +234,29 @@ async fn get_miner_type_from_command_catch_unwind(
 /// when multiple responses are received for the same device.
 #[allow(clippy::vec_init_then_push)]
 pub fn default_firmware_registry() -> Vec<Arc<dyn FirmwareEntry>> {
+    #[cfg_attr(
+        not(any(
+            feature = "antminer",
+            feature = "goldshell",
+            feature = "auradine",
+            feature = "avalonminer",
+            feature = "bitaxe",
+            feature = "forgeaxe",
+            feature = "braiins",
+            feature = "elphapex",
+            feature = "epic",
+            feature = "futurebit",
+            feature = "luxminer",
+            feature = "marathon",
+            feature = "nerdaxe",
+            feature = "proto",
+            feature = "sealminer",
+            feature = "vnish",
+            feature = "volcminer",
+            feature = "whatsminer",
+        )),
+        allow(unused_mut)
+    )]
     let mut registry: Vec<Arc<dyn FirmwareEntry>> = vec![];
 
     #[cfg(feature = "braiins")]
@@ -175,6 +295,11 @@ pub fn default_firmware_registry() -> Vec<Arc<dyn FirmwareEntry>> {
     ));
 
     // Stock firmwares — checked last so non-stock take priority
+    #[cfg(feature = "goldshell")]
+    registry.push(Arc::new(
+        asic_rs_firmwares_goldshell::firmware::GoldshellFirmware,
+    ));
+
     #[cfg(feature = "futurebit")]
     registry.push(Arc::new(
         asic_rs_firmwares_futurebit::firmware::ApolloFirmware::default(),
@@ -203,6 +328,11 @@ pub fn default_firmware_registry() -> Vec<Arc<dyn FirmwareEntry>> {
     #[cfg(feature = "auradine")]
     registry.push(Arc::new(
         asic_rs_firmwares_auradine::firmware::AuradineFirmware::default(),
+    ));
+
+    #[cfg(feature = "forgeaxe")]
+    registry.push(Arc::new(
+        asic_rs_firmwares_forgeaxe::firmware::ForgeaxeFirmware::default(),
     ));
 
     // NerdAxe before Bitaxe — both check web root but NerdAxe is more specific
@@ -278,22 +408,29 @@ impl Default for MinerFactory {
 impl MinerFactory {
     #[tracing::instrument(level = "debug", skip(self))]
     pub async fn scan_miner(&self, ip: IpAddr) -> Result<Option<Box<dyn Miner>>> {
-        if (1..self.connectivity_retries).next().is_some() {
-            if !self.check_port {
-                return self.get_miner(ip).await;
-            }
-            if check_port_open(ip, 80, self.connectivity_timeout).await {
-                return self.get_miner(ip).await;
-            }
-            if check_port_open(ip, 4028, self.connectivity_timeout).await {
-                return self.get_miner(ip).await;
-            }
-            if check_port_open(ip, 4029, self.connectivity_timeout).await {
-                return self.get_miner(ip).await;
-            }
-            if check_port_open(ip, 8889, self.connectivity_timeout).await {
-                return self.get_miner(ip).await;
-            }
+        let connection_limit = self
+            .concurrent
+            .unwrap_or(calculate_optimal_concurrency(self.ips.len().max(1)));
+        self.scan_miner_with_connection_limit(ip, Arc::new(Semaphore::new(connection_limit.max(1))))
+            .await
+    }
+
+    async fn scan_miner_with_connection_limit(
+        &self,
+        ip: IpAddr,
+        connection_limit: Arc<Semaphore>,
+    ) -> Result<Option<Box<dyn Miner>>> {
+        if !self.check_port {
+            return self.get_miner(ip).await;
+        }
+        if retry_connectivity(
+            self.connectivity_retries,
+            CONNECTIVITY_RETRY_BACKOFF,
+            || check_miner_ports(ip, self.connectivity_timeout, Arc::clone(&connection_limit)),
+        )
+        .await
+        {
+            return self.get_miner(ip).await;
         }
         tracing::trace!("no response from any miner-specific ports");
         Ok(None)
@@ -305,17 +442,22 @@ impl MinerFactory {
     /// overridden via [`Self::with_firmware_discovery_auth`].
     #[tracing::instrument(level = "debug", skip(self))]
     pub async fn get_miner(&self, ip: IpAddr) -> Result<Option<Box<dyn Miner>>> {
-        match AssertUnwindSafe(self.get_miner_inner(ip))
-            .catch_unwind()
-            .await
-        {
-            Ok(result) => result,
-            Err(panic_info) => {
+        let discovery = AssertUnwindSafe(self.get_miner_inner(ip)).catch_unwind();
+        match timeout(self.identification_timeout, discovery).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(panic_info)) => {
                 let msg = panic_message(&*panic_info);
                 tracing::error!("panic during miner discovery for {ip}: {msg}");
                 Err(anyhow::anyhow!(
                     "internal panic during miner discovery: {msg}"
                 ))
+            }
+            Err(_) => {
+                tracing::debug!(
+                    timeout_ms = self.identification_timeout.as_millis(),
+                    "miner discovery timed out for {ip}"
+                );
+                Ok(None)
             }
         }
     }
@@ -329,7 +471,7 @@ impl MinerFactory {
         );
 
         let found = {
-            let mut commands: HashSet<MinerCommand> = HashSet::new();
+            let mut commands: HashSet<DiscoveryCommand> = HashSet::new();
             for fw in registry.iter() {
                 for cmd in fw.get_discovery_commands() {
                     commands.insert(cmd);
@@ -342,23 +484,15 @@ impl MinerFactory {
                 discovery_tasks.push(get_miner_type_from_command_catch_unwind(ip, command, reg));
             }
 
-            let id_timeout = tokio::time::sleep(self.identification_timeout).fuse();
-            pin_mut!(id_timeout);
-
             let mut found: Option<Arc<dyn FirmwareEntry>> = None;
 
             loop {
                 if discovery_tasks.is_empty() {
                     break;
                 }
-                tokio::select! {
-                    _ = &mut id_timeout => break,
-                    r = discovery_tasks.next() => {
-                        if let Some(Some(fw)) = r {
-                            found = Some(fw);
-                            break;
-                        }
-                    }
+                if let Some(Some(fw)) = discovery_tasks.next().await {
+                    found = Some(fw);
+                    break;
                 }
             }
 
@@ -372,7 +506,6 @@ impl MinerFactory {
                         break;
                     }
                     tokio::select! {
-                        _ = &mut id_timeout => break,
                         _ = &mut upgrade_window => break,
                         r = discovery_tasks.next() => {
                             if let Some(Some(fw)) = r
@@ -393,7 +526,10 @@ impl MinerFactory {
             Some(fw) => {
                 let auth = self.discovery_auth_by_firmware.get(&fw.to_string());
                 match fw.build_miner(ip, auth).await {
-                    Ok(miner) => Ok(Some(miner)),
+                    Ok(miner) => {
+                        tracing::debug!(%ip, "miner identified");
+                        Ok(Some(miner))
+                    }
                     Err(e) => {
                         tracing::debug!("failed to build miner for {ip}: {e}");
                         Ok(None)
@@ -448,9 +584,31 @@ impl MinerFactory {
         self
     }
 
+    /// Set construction credentials by the registered firmware's Display name.
+    pub fn with_firmware_discovery_auth_by_name(
+        mut self,
+        firmware_name: &str,
+        auth: MinerAuth,
+    ) -> Result<Self> {
+        let registry = self
+            .search_firmwares
+            .clone()
+            .unwrap_or_else(default_firmware_registry);
+        let firmware = registry
+            .iter()
+            .find(|firmware| firmware.to_string() == firmware_name)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Firmware is not registered for discovery authentication")
+            })?;
+        self.discovery_auth_by_firmware
+            .insert(firmware.to_string(), auth);
+        Ok(self)
+    }
+
     /// Set the maximum number of addresses scanned at the same time.
     ///
-    /// If unset, scan concurrency is chosen from the number of queued hosts.
+    /// This also caps active TCP connectivity probes across the scan. If unset,
+    /// scan concurrency is chosen from the number of queued hosts.
     pub fn with_concurrent_limit(mut self, limit: usize) -> Self {
         self.concurrent = Some(limit);
         self
@@ -490,13 +648,16 @@ impl MinerFactory {
         }
     }
 
-    /// Set the maximum time spent identifying a miner once connectivity exists.
+    /// Set the maximum time spent identifying and constructing a miner.
+    ///
+    /// The deadline covers all discovery commands and firmware-specific miner
+    /// construction after connectivity has been established.
     pub fn with_identification_timeout(mut self, timeout: Duration) -> Self {
         self.identification_timeout = timeout;
         self
     }
 
-    /// Set the identification timeout in seconds.
+    /// Set the end-to-end identification and construction timeout in seconds.
     pub fn with_identification_timeout_secs(mut self, timeout_secs: u64) -> Self {
         self.identification_timeout = Duration::from_secs(timeout_secs);
         self
@@ -514,7 +675,10 @@ impl MinerFactory {
         self
     }
 
-    /// Set how many connectivity attempts are made before identification.
+    /// Set the number of connectivity retries after the initial attempt.
+    ///
+    /// Each address is probed at least once. Retries use bounded exponential
+    /// backoff and remain inside the initial scan's concurrency bound.
     pub fn with_connectivity_retries(mut self, retries: u32) -> Self {
         self.connectivity_retries = retries;
         self
@@ -710,8 +874,17 @@ impl MinerFactory {
             maybe_adjust_nofile_limit(desired_nofile);
         }
 
+        let connection_limit = Arc::new(Semaphore::new(concurrency.max(1)));
         let miners: Vec<Box<dyn Miner>> = stream::iter(self.ips.iter().copied())
-            .map(|ip| async move { self.scan_miner(ip).await.ok().flatten() })
+            .map(|ip| {
+                let connection_limit = Arc::clone(&connection_limit);
+                async move {
+                    self.scan_miner_with_connection_limit(ip, connection_limit)
+                        .await
+                        .ok()
+                        .flatten()
+                }
+            })
             .buffer_unordered(concurrency)
             .filter_map(|miner_opt| async move { miner_opt })
             .collect()
@@ -738,13 +911,21 @@ impl MinerFactory {
 
         let factory = Arc::new(self.clone());
         let ips: Arc<[IpAddr]> = Arc::from(self.ips.as_slice());
+        let connection_limit = Arc::new(Semaphore::new(concurrency.max(1)));
 
         let ip_count = ips.len();
         let stream = stream::iter(0..ip_count)
             .map(move |i| {
                 let factory = Arc::clone(&factory);
                 let ips = Arc::clone(&ips);
-                async move { factory.scan_miner(ips[i]).await.ok().flatten() }
+                let connection_limit = Arc::clone(&connection_limit);
+                async move {
+                    factory
+                        .scan_miner_with_connection_limit(ips[i], connection_limit)
+                        .await
+                        .ok()
+                        .flatten()
+                }
             })
             .buffer_unordered(concurrency)
             .filter_map(|miner_opt| async move { miner_opt });
@@ -773,13 +954,24 @@ impl MinerFactory {
 
         let factory = Arc::new(self.clone());
         let ips: Arc<[IpAddr]> = Arc::from(self.ips.as_slice());
+        let connection_limit = Arc::new(Semaphore::new(concurrency.max(1)));
 
         let ip_count = ips.len();
         let stream = stream::iter(0..ip_count)
             .map(move |i| {
                 let factory = Arc::clone(&factory);
                 let ips = Arc::clone(&ips);
-                async move { (ips[i], factory.scan_miner(ips[i]).await.ok().flatten()) }
+                let connection_limit = Arc::clone(&connection_limit);
+                async move {
+                    (
+                        ips[i],
+                        factory
+                            .scan_miner_with_connection_limit(ips[i], connection_limit)
+                            .await
+                            .ok()
+                            .flatten(),
+                    )
+                }
             })
             .buffer_unordered(concurrency);
 
@@ -876,6 +1068,227 @@ fn generate_ips_from_ranges(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn port_race_checks_every_port_when_none_succeed() {
+        let checked = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let connected = race_miner_ports(|port| {
+            checked.lock().unwrap().push(port);
+            std::future::ready(false)
+        })
+        .await;
+
+        assert!(!connected);
+        let mut checked = checked.lock().unwrap().clone();
+        checked.sort_unstable();
+        let mut expected = MINER_PORTS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(checked, expected);
+    }
+
+    #[tokio::test]
+    async fn port_race_cancels_remaining_probes_after_success() {
+        struct CancellationGuard {
+            cancelled: Arc<AtomicUsize>,
+            completed: bool,
+        }
+
+        impl Drop for CancellationGuard {
+            fn drop(&mut self) {
+                if !self.completed {
+                    self.cancelled.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+
+        let permits = Arc::new(Semaphore::new(MINER_PORTS.len()));
+        let barrier = Arc::new(tokio::sync::Barrier::new(MINER_PORTS.len()));
+        let cancelled = Arc::new(AtomicUsize::new(0));
+
+        let connected = race_miner_ports(|port| {
+            let permits = Arc::clone(&permits);
+            let barrier = Arc::clone(&barrier);
+            let cancelled = Arc::clone(&cancelled);
+            async move {
+                with_connectivity_permit(permits, async move {
+                    let mut guard = CancellationGuard {
+                        cancelled,
+                        completed: false,
+                    };
+                    barrier.wait().await;
+                    if port == MINER_PORTS[0] {
+                        guard.completed = true;
+                        true
+                    } else {
+                        std::future::pending().await
+                    }
+                })
+                .await
+            }
+        })
+        .await;
+
+        assert!(connected);
+        assert_eq!(cancelled.load(Ordering::SeqCst), MINER_PORTS.len() - 1);
+        assert_eq!(permits.available_permits(), MINER_PORTS.len());
+    }
+
+    #[tokio::test]
+    async fn port_probes_and_retries_share_global_connection_limit() {
+        let permits = Arc::new(Semaphore::new(2));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+
+        let outcomes: Vec<bool> = stream::iter(0..4)
+            .map(|_| {
+                let permits = Arc::clone(&permits);
+                let active = Arc::clone(&active);
+                let max_active = Arc::clone(&max_active);
+                async move {
+                    retry_connectivity(1, Duration::ZERO, || {
+                        let permits = Arc::clone(&permits);
+                        let active = Arc::clone(&active);
+                        let max_active = Arc::clone(&max_active);
+                        race_miner_ports(move |_| {
+                            let permits = Arc::clone(&permits);
+                            let active = Arc::clone(&active);
+                            let max_active = Arc::clone(&max_active);
+                            with_connectivity_permit(permits, async move {
+                                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                                max_active.fetch_max(current, Ordering::SeqCst);
+                                tokio::time::sleep(Duration::from_millis(2)).await;
+                                active.fetch_sub(1, Ordering::SeqCst);
+                                false
+                            })
+                        })
+                    })
+                    .await
+                }
+            })
+            .buffer_unordered(4)
+            .collect()
+            .await;
+
+        assert_eq!(outcomes, vec![false; 4]);
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(permits.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsminer")]
+    async fn identification_timeout_bounds_miner_construction() -> anyhow::Result<()> {
+        use asic_rs_firmwares_whatsminer::firmware::WhatsMinerFirmware;
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+            sync::oneshot,
+        };
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 4028)).await?;
+        let (construction_started, mut construction_started_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut identification_socket, _) = listener.accept().await?;
+            let mut request = [0_u8; 256];
+            let _bytes_read = identification_socket.read(&mut request).await?;
+            identification_socket
+                .write_all(
+                    b"{\"STATUS\":[{\"STATUS\":\"S\"}],\"DEVDETAILS\":[{\"Driver\":\"bitmicro\"}]}\0",
+                )
+                .await?;
+
+            let (_construction_socket, _) = listener.accept().await?;
+            let _ = construction_started.send(());
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            std::io::Result::Ok(())
+        });
+        let factory = MinerFactory::new()
+            .with_firmwares(vec![Arc::new(WhatsMinerFirmware::default())])
+            .with_identification_timeout(Duration::from_millis(250));
+        let started = tokio::time::Instant::now();
+
+        let miner = factory.get_miner(IpAddr::V4(Ipv4Addr::LOCALHOST)).await?;
+
+        assert!(miner.is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(construction_started_rx.try_recv().is_ok());
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn zero_connectivity_retries_still_probes_once() {
+        let mut attempts = 0;
+
+        let connected = retry_connectivity(0, Duration::ZERO, || {
+            attempts += 1;
+            std::future::ready(false)
+        })
+        .await;
+
+        assert!(!connected);
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn connectivity_retry_recovers_within_configured_attempts() {
+        let mut outcomes = [false, false, true].into_iter();
+        let mut attempts = 0;
+
+        let connected = retry_connectivity(3, Duration::ZERO, || {
+            attempts += 1;
+            std::future::ready(outcomes.next().unwrap_or(false))
+        })
+        .await;
+
+        assert!(connected);
+        assert_eq!(attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn connectivity_retry_exhaustion_uses_initial_attempt_plus_retries() {
+        let mut attempts = 0;
+
+        let connected = retry_connectivity(2, Duration::ZERO, || {
+            attempts += 1;
+            std::future::ready(false)
+        })
+        .await;
+
+        assert!(!connected);
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn connectivity_retry_backoff_is_exponential_and_bounded() {
+        assert_eq!(
+            connectivity_retry_delay(0, CONNECTIVITY_RETRY_BACKOFF),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            connectivity_retry_delay(1, CONNECTIVITY_RETRY_BACKOFF),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            connectivity_retry_delay(4, CONNECTIVITY_RETRY_BACKOFF),
+            Duration::from_millis(1600)
+        );
+        assert_eq!(
+            connectivity_retry_delay(5, CONNECTIVITY_RETRY_BACKOFF),
+            MAX_CONNECTIVITY_RETRY_BACKOFF
+        );
+        assert_eq!(
+            connectivity_retry_delay(u32::MAX, CONNECTIVITY_RETRY_BACKOFF),
+            MAX_CONNECTIVITY_RETRY_BACKOFF
+        );
+    }
+
+    #[test]
+    fn connectivity_retry_default_preserves_upstream_value() {
+        assert_eq!(MinerFactory::new().connectivity_retries, 3);
+    }
 
     #[test]
     #[cfg(feature = "whatsminer")]
@@ -980,5 +1393,23 @@ mod tests {
         };
         assert!(BitaxeFirmware::default().identify_web(&response));
         assert!(!NerdAxeFirmware::default().identify_web(&response));
+    }
+    #[test]
+    #[cfg(feature = "forgeaxe")]
+    fn default_registry_discovers_forgeos() {
+        let response = WebResponse {
+            body: "<html><title>ForgeOS</title></html>",
+            auth_header: "",
+            algo_header: "",
+            redirect_header: "",
+            status: 200,
+        };
+        let registry = default_firmware_registry();
+        let firmware = registry.iter().find(|fw| fw.identify_web(&response));
+        assert_eq!(
+            firmware.map(|fw| fw.to_string()).as_deref(),
+            Some("ForgeOS Stock")
+        );
+        assert!(firmware.is_some_and(|fw| fw.is_stock()));
     }
 }

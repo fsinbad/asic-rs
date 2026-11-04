@@ -13,28 +13,30 @@ Legend:
 
 ## Support Matrix
 
-| Firmware type | Pools Config | Scaling Config | Tuning Config | Fan Config | Light | Power Limit | Restart | Pause/Resume | Upgrade FW | Change PWD | Factory Reset | Read Logs |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| AntMiner Stock | :lucide-check-check: | :lucide-x: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-x: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: |
-| Auradine Stock | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: |
-| AvalonMiner Stock | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-check-check: | :lucide-check-check: | :lucide-list-todo: | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: |
-| Bitaxe Stock | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: |
-| Braiins | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-x: | :lucide-check-check: | :lucide-list-todo: | :lucide-check-check: |
-| Elphapex Stock | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-check-check: | :lucide-x: | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: |
-| FutureBit Stock | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: |
-| LuxOS | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-check-check: | :lucide-x: | :lucide-check-check: | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: |
-| Marathon | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: |
-| Nerdaxe Stock | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: |
-| Proto Stock | :lucide-check-check: | :lucide-x: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-x: | :lucide-check-check: | :lucide-x: | :lucide-check-check: |
-| SealMiner Stock | :lucide-check-check: | :lucide-x: | :lucide-check-check: | :lucide-x: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: |
-| UMC OS | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-x: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-x: | :lucide-check-check: |
-| VNish | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-x: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: |
-| VolcMiner Stock | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-check-check: | :lucide-x: | :lucide-x: |
-| WhatsMiner Stock | :lucide-list-todo: | :lucide-x: | :lucide-list-todo: | :lucide-x: | :lucide-list-todo: | :lucide-list-todo: | :lucide-list-todo: | :lucide-list-todo: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: |
+| Firmware type | Pools Config | Scaling Config | Tuning Config | Fan Config | Light | Power Limit | Restart | Restart Mining | Pause/Resume | Upgrade FW | Change PWD | Factory Reset Settings | Restore Stock OS | Read Logs |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| AntMiner Stock | :lucide-check-check: | :lucide-x: | :lucide-list-todo: | :lucide-list-todo: | :lucide-check-check: | :lucide-x: | :lucide-check-check: | :lucide-x: | :lucide-list-todo: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-x: | :lucide-list-todo: |
+| Auradine Stock | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: |
+| AvalonMiner Stock | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-check-check: | :lucide-check-check: | :lucide-list-todo: | :lucide-x: | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: |
+| Bitaxe Stock | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-list-todo: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: |
+| Braiins | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-list-todo: | :lucide-check-check: | :lucide-list-todo: | :lucide-list-todo: | :lucide-check-check: |
+| Elphapex Stock | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-check-check: | :lucide-x: | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: |
+| ForgeOS Stock | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: |
+| FutureBit Stock | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: |
+| Goldshell Stock | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: |
+| LuxOS | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-check-check: | :lucide-x: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-check-check: | :lucide-x: |
+| Marathon | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: |
+| Nerdaxe Stock | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: |
+| Proto Stock | :lucide-check-check: | :lucide-x: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-x: | :lucide-check-check: | :lucide-x: | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-check-check: |
+| SealMiner Stock | :lucide-check-check: | :lucide-x: | :lucide-check-check: | :lucide-x: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-x: | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: |
+| UMC OS | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-x: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-x: | :lucide-list-todo: | :lucide-check-check: |
+| VNish | :lucide-check-check: | :lucide-x: | :lucide-check-check: | :lucide-x: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-x: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: | :lucide-check-check: |
+| VolcMiner Stock | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-check-check: | :lucide-x: | :lucide-x: | :lucide-x: |
+| WhatsMiner Stock | :lucide-list-todo: | :lucide-x: | :lucide-list-todo: | :lucide-x: | :lucide-list-todo: | :lucide-list-todo: | :lucide-list-todo: | :lucide-x: | :lucide-list-todo: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: | :lucide-x: |
 
 ## Exact Supported Models
 
-??? quote "AntMiner (56 models across 22 families)"
+??? quote "AntMiner (63 models across 25 families)"
 
 	??? note "D3 family (1 model)"
 		 - [x] `ANTMINER D3`
@@ -64,6 +66,8 @@ Legend:
 		 - [x] `ANTMINER L7`
 	??? note "L9 family (1 model)"
 		 - [x] `ANTMINER L9`
+	??? note "L11 family (1 model)"
+		 - [x] `ANTMINER L11`
 	??? note "S9 family (3 models)"
 		 - [x] `ANTMINER S9`
 		 - [x] `ANTMINER S9I`
@@ -92,15 +96,20 @@ Legend:
 		 - [x] `ANTMINER S19K PRO`
 		 - [x] `ANTMINER S19L`
 		 - [x] `ANTMINER S19PRO+`
-	??? note "S21 family (8 models)"
+	??? note "S21 family (11 models)"
 		 - [x] `ANTMINER S21` (also: `ANTMINER BHB68601`, `ANTMINER BHB68606`)
 		 - [x] `ANTMINER S21 HYD.` (also: `ANTMINER S21 HYDRO`)
 		 - [x] `ANTMINER S21 PRO`
 		 - [x] `ANTMINER S21 PRO+`
 		 - [x] `ANTMINER S21 XP`
+		 - [x] `ANTMINER S21 XP HYD.` (also: `ANTMINER S21 XP HYDRO`, `ANTMINER S21XPHYD.`, `ANTMINER S21XPHYDRO`)
 		 - [x] `ANTMINER S21+`
 		 - [x] `ANTMINER S21+ HYD.` (also: `ANTMINER S21+ HYDRO`)
+		 - [x] `ANTMINER S21++`
 		 - [x] `ANTMINER S21E XP HYD.` (also: `ANTMINER S21E XP HYDRO`)
+		 - [x] `ANTMINER S21J XP HYD.` (also: `ANTMINER S21J XP HYDRO`, `ANTMINER S21JXPHYD.`, `ANTMINER S21JXPHYDRO`)
+	??? note "S23 family (1 model)"
+		 - [x] `ANTMINER S23 HYD.` (also: `ANTMINER S23 HYDRO`, `ANTMINER S23HYD.`, `ANTMINER S23HYDRO`)
 	??? note "T9 family (1 model)"
 		 - [x] `ANTMINER T9`
 	??? note "T17 family (3 models)"
@@ -111,9 +120,12 @@ Legend:
 		 - [x] `ANTMINER T19`
 	??? note "T21 family (1 model)"
 		 - [x] `ANTMINER T21`
-	??? note "Z15 family (2 models)"
+	??? note "Z11 family (1 model)"
+		 - [x] `ANTMINER Z11J`
+	??? note "Z15 family (3 models)"
 		 - [x] `ANTMINER Z15`
 		 - [x] `ANTMINER Z15 PRO`
+		 - [x] `ANTMINER Z15J`
 ??? quote "Auradine (5 models across 5 families)"
 
 	??? note "AH3880 family (1 model)"
@@ -126,7 +138,7 @@ Legend:
 		 - [x] `AT1500`
 	??? note "AT2880 family (1 model)"
 		 - [x] `AT2880`
-??? quote "AvalonMiner (21 models across 11 families)"
+??? quote "AvalonMiner (22 models across 11 families)"
 
 	??? note "7xx family (3 models)"
 		 - [x] `721`
@@ -149,8 +161,9 @@ Legend:
 		 - [x] `1246`
 	??? note "14xx family (1 model)"
 		 - [x] `1466`
-	??? note "15 family (1 model)"
+	??? note "15 family (2 models)"
 		 - [x] `15` (also: `15PRO`)
+		 - [x] `15XP`
 	??? note "15xx family (3 models)"
 		 - [x] `1566`
 		 - [x] `1566HA`
@@ -188,12 +201,20 @@ Legend:
 		 - [x] `BLOCKMINER 520i`
 	??? note "S19 family (1 model)"
 		 - [x] `ANTMINER S19J PRO DUAL`
+??? quote "Forgeaxe (1 model across 1 family)"
+
+	??? note "BITFORGE family (1 model)"
+		 - [x] `BITFORGE_NANO` (also: `BM1370`)
 ??? quote "FutureBit (2 models across 2 families)"
 
 	??? note "APOLLO1 family (1 model)"
 		 - [x] `Apollo1`
 	??? note "APOLLO2 family (1 model)"
 		 - [x] `Apollo2`
+??? quote "Goldshell (1 model across 1 family)"
+
+	??? note "SC5 family (1 model)"
+		 - [x] `SC5PRO`
 ??? quote "Nerdaxe (4 models across 4 families)"
 
 	??? note "BM1366 family (1 model)"
@@ -208,10 +229,12 @@ Legend:
 
 	??? note "RIG family (1 model)"
 		 - [x] `RIG`
-??? quote "SealMiner (1 model across 1 family)"
+??? quote "SealMiner (2 models across 2 families)"
 
 	??? note "A2 family (1 model)"
 		 - [x] `A2`
+	??? note "A3 family (1 model)"
+		 - [x] `A3 Pro Hydro`
 ??? quote "VolcMiner (1 model across 1 family)"
 
 	??? note "D1 family (1 model)"

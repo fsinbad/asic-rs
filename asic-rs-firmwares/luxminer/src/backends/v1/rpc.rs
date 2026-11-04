@@ -1,3 +1,5 @@
+use crate::firmware::LuxMinerFirmware;
+
 use std::net::IpAddr;
 
 use anyhow;
@@ -23,6 +25,15 @@ impl LUXMinerRPCAPI {
         Self {
             ip,
             port: 4028,
+            session_token: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_with_port(ip: IpAddr, port: u16) -> Self {
+        Self {
+            ip,
+            port,
             session_token: None,
         }
     }
@@ -145,6 +156,10 @@ impl LUXMinerRPCAPI {
 
     pub async fn reset_miner(&self) -> anyhow::Result<Value> {
         self.send_command("resetminer", true, None).await
+    }
+
+    pub async fn uninstall_luxos(&self) -> anyhow::Result<Value> {
+        self.send_command("uninstallluxos", true, None).await
     }
 
     pub async fn sleep(&self) -> anyhow::Result<Value> {
@@ -387,7 +402,8 @@ impl APIClient for LUXMinerRPCAPI {
                 .await
                 .map_err(|e| anyhow::anyhow!(e.to_string())),
             _ => Err(anyhow::anyhow!(
-                "Unsupported command type for LuxMiner RPC API"
+                "Unsupported command type for {} RPC API",
+                LuxMinerFirmware::default()
             )),
         }
     }
@@ -454,9 +470,10 @@ impl StatusFromLuxMiner for RPCCommandStatus {
             .pointer("/STATUS/0/STATUS")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                RPCError::StatusCheckFailed(
-                    "Failed to parse status from LuxMiner response".to_string(),
-                )
+                RPCError::StatusCheckFailed(format!(
+                    "Failed to parse status from {} response",
+                    LuxMinerFirmware::default()
+                ))
             })?;
 
         let message = json.pointer("/STATUS/0/Msg").and_then(|v| v.as_str());

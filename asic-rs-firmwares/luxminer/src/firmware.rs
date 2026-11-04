@@ -1,7 +1,7 @@
 use std::{fmt::Display, net::IpAddr};
 
 use asic_rs_core::{
-    data::command::MinerCommand,
+    data::command::DiscoveryCommand,
     discovery::{HTTP_WEB_ROOT, RPC_VERSION},
     errors::ModelSelectionError,
     traits::{
@@ -11,7 +11,6 @@ use asic_rs_core::{
         identification::{FirmwareIdentification, WebResponse},
         make::MinerMake,
         miner::{Miner, MinerAuth, MinerConstructor},
-        model::MinerModel,
     },
     util,
 };
@@ -28,14 +27,16 @@ impl Display for LuxMinerFirmware {
 }
 
 impl DiscoveryCommands for LuxMinerFirmware {
-    fn get_discovery_commands(&self) -> Vec<MinerCommand> {
+    fn get_discovery_commands(&self) -> Vec<DiscoveryCommand> {
         vec![HTTP_WEB_ROOT, RPC_VERSION]
     }
 }
 
 #[async_trait]
 impl MinerFirmware for LuxMinerFirmware {
-    async fn get_model(ip: IpAddr) -> Result<impl MinerModel + Send, ModelSelectionError> {
+    type Model = asic_rs_makes_antminer::models::AntMinerModel;
+
+    async fn get_model(ip: IpAddr) -> Result<Self::Model, ModelSelectionError> {
         let data = util::send_rpc_command(&ip, "version")
             .await
             .ok_or(ModelSelectionError::NoModelResponse)?;
@@ -77,5 +78,58 @@ impl FirmwareEntry for LuxMinerFirmware {
             miner.set_auth(auth.clone());
         }
         Ok(miner)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{str::FromStr, sync::Arc};
+
+    use anyhow::Context;
+    use asic_rs_core::test::util::get_miner;
+
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires live miner; set MINER_IP"]
+    async fn restore_stock_os_support_live_test_auto_detect() -> anyhow::Result<()> {
+        let ip_str = std::env::var("MINER_IP").context("MINER_IP is not set")?;
+        let ip =
+            IpAddr::from_str(&ip_str).with_context(|| format!("invalid MINER_IP: {ip_str}"))?;
+
+        let miner = get_miner(ip, Arc::new(LuxMinerFirmware::default()))
+            .await?
+            .context("no miner detected at MINER_IP")?;
+
+        anyhow::ensure!(
+            miner.supports_restore_stock_os(),
+            "miner does not advertise restore stock OS support"
+        );
+        println!("supports_restore_stock_os true");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "DESTRUCTIVE: restores stock OS; set MINER_IP"]
+    async fn restore_stock_os_live_test_auto_detect() -> anyhow::Result<()> {
+        let ip_str = std::env::var("MINER_IP").context("MINER_IP is not set")?;
+        let ip =
+            IpAddr::from_str(&ip_str).with_context(|| format!("invalid MINER_IP: {ip_str}"))?;
+
+        let miner = get_miner(ip, Arc::new(LuxMinerFirmware::default()))
+            .await?
+            .context("no miner detected at MINER_IP")?;
+
+        anyhow::ensure!(
+            miner.supports_restore_stock_os(),
+            "miner does not advertise restore stock OS support"
+        );
+        let result = miner.restore_stock_os().await?;
+
+        println!("restore stock OS result: {result:?}");
+        assert!(result.accepted);
+
+        Ok(())
     }
 }

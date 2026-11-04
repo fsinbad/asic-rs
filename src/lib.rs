@@ -18,8 +18,12 @@ pub use asic_rs_firmwares_braiins as braiins;
 pub use asic_rs_firmwares_elphapex as elphapex;
 #[cfg(feature = "epic")]
 pub use asic_rs_firmwares_epic as epic;
+#[cfg(feature = "forgeaxe")]
+pub use asic_rs_firmwares_forgeaxe as forgeaxe;
 #[cfg(feature = "futurebit")]
 pub use asic_rs_firmwares_futurebit as futurebit;
+#[cfg(feature = "goldshell")]
+pub use asic_rs_firmwares_goldshell as goldshell;
 #[cfg(feature = "luxminer")]
 pub use asic_rs_firmwares_luxminer as luxminer;
 #[cfg(feature = "marathon")]
@@ -39,5 +43,3 @@ pub use asic_rs_firmwares_whatsminer as whatsminer;
 
 pub mod factory;
 pub mod listener;
-#[cfg(feature = "python")]
-mod python;

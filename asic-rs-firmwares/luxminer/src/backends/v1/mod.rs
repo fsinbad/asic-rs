@@ -14,6 +14,7 @@ use asic_rs_core::{
         command::MinerCommand,
         device::{DeviceInfo, HashAlgorithm},
         fan::FanData,
+        firmware::RestoreStockOsResult,
         hashrate::{HashRate, HashRateUnit},
         message::{MessageSeverity, MinerMessage},
         miner::TuningTarget,
@@ -171,7 +172,10 @@ impl APIClient for LuxMinerV1 {
     async fn get_api_result(&self, command: &MinerCommand) -> anyhow::Result<Value> {
         match command {
             MinerCommand::RPC { .. } => self.rpc.get_api_result(command).await,
-            _ => Err(anyhow::anyhow!("Unsupported command type for LuxMiner API")),
+            _ => Err(anyhow::anyhow!(
+                "Unsupported command type for {} API",
+                LuxMinerFirmware::default()
+            )),
         }
     }
 }
@@ -461,6 +465,14 @@ impl GetDataLocations for LuxMinerV1 {
                     tag: None,
                 },
             )],
+            DataField::DevFeeConnected => vec![(
+                RPC_CONFIG,
+                DataExtractor {
+                    func: get_by_pointer,
+                    key: Some("/CONFIG/0/FeeStatus"),
+                    tag: None,
+                },
+            )],
             DataField::Wattage => vec![(
                 RPC_POWER,
                 DataExtractor {
@@ -677,9 +689,9 @@ impl GetHashboards for LuxMinerV1 {
                         HashRate {
                             value: f,
                             unit: HashRateUnit::MegaHash,
-                            algo: "SHA256".to_string(),
+                            algo: self.device_info.algo,
                         }
-                        .as_unit(HashRateUnit::default())
+                        .as_default_unit()
                     });
                 board.serial_number = dev
                     .get("SerialNumber")
@@ -695,9 +707,9 @@ impl GetHashboards for LuxMinerV1 {
                         HashRate {
                             value: f,
                             unit: HashRateUnit::GigaHash,
-                            algo: "SHA256".to_string(),
+                            algo: self.device_info.algo,
                         }
-                        .as_unit(HashRateUnit::default())
+                        .as_default_unit()
                     });
                 board.board_temperature = stats
                     .get(format!("temp_pcb{b_id}"))
@@ -765,9 +777,9 @@ impl GetHashboards for LuxMinerV1 {
                                     HashRate {
                                         value: hr,
                                         unit: HashRateUnit::GigaHash,
-                                        algo: "SHA256".to_string(),
+                                        algo: self.device_info.algo,
                                     }
-                                    .as_unit(HashRateUnit::default())
+                                    .as_default_unit()
                                 }),
                                 frequency: o
                                     .get("Frequency")
@@ -820,9 +832,9 @@ impl GetHashrate for LuxMinerV1 {
             HashRate {
                 value: f,
                 unit: HashRateUnit::GigaHash,
-                algo: "SHA256".to_string(),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default())
+            .as_default_unit()
         })
     }
 }
@@ -850,9 +862,9 @@ impl GetExpectedHashrate for LuxMinerV1 {
             HashRate {
                 value: expected_hashrate,
                 unit: HashRateUnit::MegaHash,
-                algo: "SHA256".to_string(),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default()),
+            .as_default_unit(),
         )
     }
 }
@@ -888,6 +900,19 @@ impl GetUptime for LuxMinerV1 {
     }
 }
 
+impl GetBestShare for LuxMinerV1 {}
+impl GetSessionBestShare for LuxMinerV1 {}
+
+impl GetOperatingState for LuxMinerV1 {}
+
+impl GetDevFeeConnected for LuxMinerV1 {
+    fn parse_devfee_connected(&self, data: &HashMap<DataField, Value>) -> Option<bool> {
+        let status = data.extract::<String>(DataField::DevFeeConnected)?;
+        let status = status.trim();
+        (!status.is_empty()).then(|| status.eq_ignore_ascii_case("ok"))
+    }
+}
+
 impl GetIsMining for LuxMinerV1 {}
 
 impl GetPools for LuxMinerV1 {
@@ -900,6 +925,12 @@ impl GetPools for LuxMinerV1 {
                     .get("GROUP")
                     .and_then(Value::as_u64)
                     .unwrap_or_default();
+                let accepted_shares = pool.get("Accepted").and_then(Value::as_u64);
+                let rejected_shares = pool.get("Rejected").and_then(Value::as_u64);
+                let last_share_time = accepted_shares
+                    .filter(|shares| *shares > 0)
+                    .and_then(|_| pool.get("Last Share Time"))
+                    .and_then(asic_rs_core::util::parse_last_share_time);
                 let pool_data = PoolData {
                     position: pool.get("POOL").and_then(Value::as_u64).map(|id| id as u16),
                     url: pool
@@ -912,8 +943,9 @@ impl GetPools for LuxMinerV1 {
                         .and_then(|v| v.as_str())
                         .map(|s| s == "Alive"),
                     active: pool.get("Stratum Active").and_then(|v| v.as_bool()),
-                    accepted_shares: pool.get("Accepted").and_then(|v| v.as_u64()),
-                    rejected_shares: pool.get("Rejected").and_then(|v| v.as_u64()),
+                    accepted_shares,
+                    rejected_shares,
+                    last_share_time,
                 };
 
                 if let Some((_, group)) = groups.iter_mut().find(|(id, _)| *id == group_id) {
@@ -979,7 +1011,9 @@ impl GetTuningTarget for LuxMinerV1 {
 
 impl GetScaledTuningTarget for LuxMinerV1 {}
 impl GetTuningCapabilities for LuxMinerV1 {}
+impl SupportsTimezoneConfig for LuxMinerV1 {}
 impl GetPsuFans for LuxMinerV1 {}
+impl GetPsus for LuxMinerV1 {}
 
 impl GetMessages for LuxMinerV1 {
     fn parse_messages(&self, data: &HashMap<DataField, Value>) -> Vec<MinerMessage> {
@@ -1039,7 +1073,8 @@ impl SetFaultLight for LuxMinerV1 {
             true => "blink",
             false => "auto",
         };
-        Ok(self.rpc.ledset("red", mode).await.is_ok())
+        self.rpc.ledset("red", mode).await?;
+        Ok(true)
     }
     fn supports_set_fault_light(&self) -> bool {
         true
@@ -1131,7 +1166,8 @@ impl Restart for LuxMinerV1 {
 #[async_trait]
 impl Pause for LuxMinerV1 {
     async fn pause(&self, _at_time: Option<Duration>) -> anyhow::Result<bool> {
-        Ok(self.rpc.sleep().await.is_ok())
+        self.rpc.sleep().await?;
+        Ok(true)
     }
     fn supports_pause(&self) -> bool {
         true
@@ -1141,7 +1177,8 @@ impl Pause for LuxMinerV1 {
 #[async_trait]
 impl Resume for LuxMinerV1 {
     async fn resume(&self, _at_time: Option<Duration>) -> anyhow::Result<bool> {
-        Ok(self.rpc.wakeup().await.is_ok())
+        self.rpc.wakeup().await?;
+        Ok(true)
     }
     fn supports_resume(&self) -> bool {
         true
@@ -1163,6 +1200,33 @@ impl ReadLogs for LuxMinerV1 {
 impl FactoryReset for LuxMinerV1 {
     fn supports_factory_reset(&self) -> bool {
         false
+    }
+}
+
+#[async_trait]
+impl RestartMining for LuxMinerV1 {
+    async fn restart_mining(&self) -> anyhow::Result<bool> {
+        self.rpc.reset_miner().await?;
+        Ok(true)
+    }
+
+    fn supports_restart_mining(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(test)]
+mod restart_mining_tests;
+
+#[async_trait]
+impl RestoreStockOs for LuxMinerV1 {
+    async fn restore_stock_os(&self) -> anyhow::Result<RestoreStockOsResult> {
+        self.rpc.uninstall_luxos().await?;
+        Ok(RestoreStockOsResult::accepted(None))
+    }
+
+    fn supports_restore_stock_os(&self) -> bool {
+        true
     }
 }
 
@@ -1203,7 +1267,11 @@ impl SupportsFanConfig for LuxMinerV1 {
 
 impl SupportsTemperatureConfig for LuxMinerV1 {}
 impl GetTuningPercent for LuxMinerV1 {}
+impl SetHashboardsEnabled for LuxMinerV1 {}
+
 impl SetTuningPercent for LuxMinerV1 {}
+
+impl SupportsPresets for LuxMinerV1 {}
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -1222,6 +1290,78 @@ mod tests {
         CONFIG, DEVS, EVENTS, FANS, HEALTHCHIPGET_0, HEALTHCHIPGET_1, HEALTHCHIPGET_2, POOLS,
         POWER, PROFILES, STATS, SUMMARY, TEMPS, VERSION, VOLTAGEGET_0, VOLTAGEGET_1, VOLTAGEGET_2,
     };
+
+    struct MockRestoreServer {
+        port: u16,
+        requests: Arc<Mutex<Vec<Value>>>,
+        task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    }
+
+    async fn mock_restore_server(
+        uninstall_status: &'static str,
+        uninstall_message: &'static str,
+    ) -> anyhow::Result<MockRestoreServer> {
+        mock_privileged_server("uninstallluxos", uninstall_status, uninstall_message).await
+    }
+
+    /// Answers `session`, then the one privileged `command` with the given
+    /// status and message.
+    async fn mock_privileged_server(
+        privileged_command: &'static str,
+        uninstall_status: &'static str,
+        uninstall_message: &'static str,
+    ) -> anyhow::Result<MockRestoreServer> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = Arc::clone(&requests);
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+
+        let task = tokio::spawn(async move {
+            for request_idx in 0..2 {
+                let (socket, _) =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+                        .await
+                        .map_err(|_| {
+                            anyhow::anyhow!("timed out waiting for request {}", request_idx + 1)
+                        })??;
+                let (reader, mut writer) = socket.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                reader.read_line(&mut line).await?;
+
+                let request: Value = serde_json::from_str(line.trim_end())?;
+                let command = request
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                server_requests.lock().unwrap().push(request.clone());
+
+                let response = match command {
+                    "session" => json!({
+                        "SESSION": [{ "SessionID": "test-session-id" }],
+                        "STATUS": [{ "STATUS": "S", "Msg": "Session found" }]
+                    }),
+                    command if command == privileged_command => json!({
+                        "STATUS": [{
+                            "STATUS": uninstall_status,
+                            "Msg": uninstall_message
+                        }]
+                    }),
+                    other => anyhow::bail!("unexpected command: {other}"),
+                };
+
+                writer.write_all(format!("{response}\n").as_bytes()).await?;
+            }
+
+            Ok(())
+        });
+
+        Ok(MockRestoreServer {
+            port,
+            requests,
+            task,
+        })
+    }
 
     #[tokio::test]
 
@@ -1384,6 +1524,7 @@ mod tests {
         );
         assert_eq!(miner_data.hostname, Some("UrlacherS19k".to_string()));
         assert_eq!(miner_data.api_version, Some("3.7".to_string()));
+        assert_eq!(miner_data.devfee_connected, Some(true));
         assert_eq!(
             miner_data.firmware_version,
             Some("2025.4.8.220305".to_string())
@@ -1402,6 +1543,10 @@ mod tests {
         assert_eq!(miner_data.pools.len(), 2);
         assert_eq!(miner_data.pools[0].len(), 2);
         assert_eq!(miner_data.pools[1].len(), 2);
+        assert!(miner_data.pools[0].pools[0].last_share_time.is_some());
+        assert_eq!(miner_data.pools[0].pools[1].last_share_time, None);
+        assert!(miner_data.pools[1].pools[0].last_share_time.is_some());
+        assert_eq!(miner_data.pools[1].pools[1].last_share_time, None);
 
         assert_eq!(miner_data.messages.len(), 2);
         assert_eq!(miner_data.messages[0].severity, MessageSeverity::Warning);
@@ -1416,6 +1561,24 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn devfee_connection_uses_fee_status() {
+        let miner = LuxMinerV1::new(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S19KPro);
+
+        for (status, expected) in [
+            (Some(json!("Ok")), Some(true)),
+            (Some(json!("Connection failed")), Some(false)),
+            (Some(json!("  ")), None),
+            (None, None),
+        ] {
+            let mut data = HashMap::new();
+            if let Some(status) = status {
+                data.insert(DataField::DevFeeConnected, status);
+            }
+            assert_eq!(miner.parse_devfee_connected(&data), expected);
+        }
     }
 
     #[test]
@@ -1587,6 +1750,136 @@ mod tests {
             requests[3],
             ("removegroup".to_string(), Some("0".to_string()))
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restore_stock_os_sends_authenticated_uninstall_command() -> anyhow::Result<()> {
+        let MockRestoreServer {
+            port,
+            requests,
+            task,
+        } = mock_restore_server("S", "Uninstalling LuxOS").await?;
+        let mut miner = LuxMinerV1::new(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S19KPro);
+        miner.rpc = LUXMinerRPCAPI::new_with_port(miner.ip, port);
+
+        assert!(!miner.supports_factory_reset());
+        assert!(miner.supports_restore_stock_os());
+        assert_eq!(
+            miner.restore_stock_os().await?,
+            RestoreStockOsResult::accepted(None)
+        );
+
+        task.await??;
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![
+                json!({ "command": "session" }),
+                json!({
+                    "command": "uninstallluxos",
+                    "parameter": "test-session-id"
+                })
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restore_stock_os_returns_rpc_rejection() -> anyhow::Result<()> {
+        let MockRestoreServer {
+            port,
+            requests,
+            task,
+        } = mock_restore_server("E", "Uninstall denied").await?;
+        let mut miner = LuxMinerV1::new(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S19KPro);
+        miner.rpc = LUXMinerRPCAPI::new_with_port(miner.ip, port);
+
+        let error = miner.restore_stock_os().await.unwrap_err();
+
+        task.await??;
+        assert!(error.to_string().contains("Uninstall denied"));
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![
+                json!({ "command": "session" }),
+                json!({
+                    "command": "uninstallluxos",
+                    "parameter": "test-session-id"
+                })
+            ]
+        );
+
+        Ok(())
+    }
+
+    fn miner_with_mock_rpc(port: u16) -> LuxMinerV1 {
+        let mut miner = LuxMinerV1::new(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S19KPro);
+        miner.rpc = LUXMinerRPCAPI::new_with_port(miner.ip, port);
+        miner
+    }
+
+    #[tokio::test]
+    async fn pause_and_resume_report_why_the_miner_refused() -> anyhow::Result<()> {
+        let MockRestoreServer { port, task, .. } =
+            mock_privileged_server("curtail", "E", "Miner is already in sleep mode").await?;
+        let error = miner_with_mock_rpc(port).pause(None).await.unwrap_err();
+        task.await??;
+        assert!(
+            error.to_string().contains("Miner is already in sleep mode"),
+            "{error}"
+        );
+
+        let MockRestoreServer {
+            port,
+            requests,
+            task,
+        } = mock_privileged_server("curtail", "E", "Miner is already active").await?;
+        let error = miner_with_mock_rpc(port).resume(None).await.unwrap_err();
+        task.await??;
+        assert!(
+            error.to_string().contains("Miner is already active"),
+            "{error}"
+        );
+        assert_eq!(
+            requests.lock().unwrap()[1],
+            json!({ "command": "curtail", "parameter": "test-session-id,wakeup" })
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_fault_light_reports_why_the_miner_refused() -> anyhow::Result<()> {
+        let MockRestoreServer {
+            port,
+            requests,
+            task,
+        } = mock_privileged_server("ledset", "E", "Invalid LED state").await?;
+
+        let error = miner_with_mock_rpc(port)
+            .set_fault_light(true)
+            .await
+            .unwrap_err();
+
+        task.await??;
+        assert!(error.to_string().contains("Invalid LED state"), "{error}");
+        assert_eq!(
+            requests.lock().unwrap()[1],
+            json!({ "command": "ledset", "parameter": "test-session-id,red,blink" })
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepted_pause_still_returns_true() -> anyhow::Result<()> {
+        let MockRestoreServer { port, task, .. } =
+            mock_privileged_server("curtail", "S", "Curtail sleep").await?;
+
+        assert!(miner_with_mock_rpc(port).pause(None).await?);
+        task.await??;
 
         Ok(())
     }

@@ -3,8 +3,9 @@ use std::{collections::HashMap, net::IpAddr, str::FromStr, time::Duration};
 use anyhow;
 use asic_rs_core::{
     config::{
-        collector::{ConfigCollector, ConfigField, ConfigLocation},
+        collector::{ConfigCollector, ConfigExtractor, ConfigField, ConfigLocation},
         pools::PoolGroupConfig,
+        timezone::{TimezoneConfig, Tz},
     },
     data::{
         board::BoardData,
@@ -67,15 +68,48 @@ impl APIClient for BraiinsV2505 {
             MinerCommand::RPC { .. } => self.rpc.get_api_result(command).await,
             MinerCommand::GraphQL { .. } => self.graphql.get_api_result(command).await,
             MinerCommand::WebAPI { .. } => self.web.get_api_result(command).await,
-            _ => Err(anyhow::anyhow!("Unsupported command type for Braiins API")),
+            _ => Err(anyhow::anyhow!(
+                "Unsupported command type for {} API",
+                BraiinsFirmware::default()
+            )),
         }
+    }
+}
+
+#[async_trait]
+impl SetHashboardsEnabled for BraiinsV2505 {
+    async fn set_hashboards_enabled(
+        &self,
+        board_indices: &[u8],
+        enabled: bool,
+    ) -> anyhow::Result<bool> {
+        self.graphql
+            .set_hashboards_enabled(board_indices, enabled)
+            .await
+    }
+
+    fn supports_set_hashboards_enabled(&self) -> bool {
+        true
     }
 }
 
 impl GetConfigsLocations for BraiinsV2505 {
     #[allow(unused_variables)]
     fn get_configs_locations(&self, data_field: ConfigField) -> Vec<ConfigLocation> {
-        vec![]
+        const GQL_TIMEZONE: MinerCommand = MinerCommand::GraphQL {
+            command: "{ bos { timezone { id } timezoneList { id } } }",
+        };
+        match data_field {
+            ConfigField::Timezone => vec![(
+                GQL_TIMEZONE,
+                ConfigExtractor {
+                    func: get_by_pointer,
+                    key: Some("/bos"),
+                    tag: None,
+                },
+            )],
+            _ => vec![],
+        }
     }
 }
 
@@ -426,6 +460,65 @@ impl GetTuningCapabilities for BraiinsV2505 {
         Some(power_target_capabilities(power_target))
     }
 }
+#[async_trait]
+impl SupportsTimezoneConfig for BraiinsV2505 {
+    fn supports_timezone_config(&self) -> bool {
+        true
+    }
+
+    fn parse_timezone_config(
+        &self,
+        data: &HashMap<ConfigField, Value>,
+    ) -> anyhow::Result<TimezoneConfig> {
+        let obj = data
+            .get(&ConfigField::Timezone)
+            .ok_or_else(|| anyhow::anyhow!("No timezone data returned"))?;
+        let timezone = obj
+            .pointer("/timezone/id")
+            .and_then(|v| v.as_str())
+            .map(|id| {
+                id.parse::<Tz>()
+                    .map_err(|_| anyhow::anyhow!("Unknown IANA timezone {id:?}"))
+            })
+            .transpose()?;
+        // BOS ids are IANA names already; drop any the bundled database lacks
+        // rather than failing the whole read over one unknown entry.
+        let available = obj
+            .pointer("/timezoneList")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.get("id").and_then(|v| v.as_str()))
+                    .filter_map(|id| id.parse::<Tz>().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(TimezoneConfig {
+            timezone,
+            available,
+        })
+    }
+
+    /// BOS speaks IANA natively, so the zone name goes over the wire as is.
+    async fn set_timezone_config(&self, config: TimezoneConfig) -> anyhow::Result<bool> {
+        let timezone = config
+            .timezone
+            .ok_or_else(|| anyhow::anyhow!("Timezone config has no timezone to set"))?;
+        let mutation = r#"mutation ($tz: String!) {
+            bos { setTimezone(timezone: $tz) { __typename } }
+        }"#;
+        let variables = json!({ "tz": timezone.name() });
+        let result = self
+            .graphql
+            .send_graphql_command(mutation, true, Some(variables))
+            .await?;
+        // BosResult is a union; a `BosError` variant signals failure.
+        let typename = result
+            .pointer("/bos/setTimezone/__typename")
+            .and_then(|v| v.as_str());
+        Ok(matches!(typename, Some(t) if t != "BosError"))
+    }
+}
 
 impl GetHashboards for BraiinsV2505 {
     fn parse_hashboards(&self, data: &HashMap<DataField, Value>) -> Vec<BoardData> {
@@ -453,17 +546,17 @@ impl GetHashboards for BraiinsV2505 {
                     HashRate {
                         value: f,
                         unit: HashRateUnit::MegaHash,
-                        algo: "SHA256".to_string(),
+                        algo: self.device_info.algo,
                     }
-                    .as_unit(HashRateUnit::default())
+                    .as_default_unit()
                 });
             board.expected_hashrate = solver.get("nominalMhs").and_then(|v| v.as_f64()).map(|f| {
                 HashRate {
                     value: f,
                     unit: HashRateUnit::MegaHash,
-                    algo: "SHA256".to_string(),
+                    algo: self.device_info.algo,
                 }
-                .as_unit(HashRateUnit::default())
+                .as_default_unit()
             });
 
             // Temperature names changed to SCREAMING_SNAKE_CASE in 25.05 and now include
@@ -502,7 +595,10 @@ impl GetHashboards for BraiinsV2505 {
                 .pointer("/hwDetails/frequencyMhz")
                 .and_then(|v| v.as_f64())
                 .map(Frequency::from_megahertz);
-            board.active = board.hashrate.as_ref().map(|hr| hr.value > 0.0);
+            board.active = board
+                .frequency
+                .as_ref()
+                .map(|frequency| frequency.as_megahertz() > 0.0);
         }
 
         hashboards
@@ -515,9 +611,9 @@ impl GetHashrate for BraiinsV2505 {
             HashRate {
                 value: f,
                 unit: HashRateUnit::MegaHash,
-                algo: "SHA256".to_string(),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default())
+            .as_default_unit()
         })
     }
 }
@@ -528,9 +624,9 @@ impl GetExpectedHashrate for BraiinsV2505 {
             HashRate {
                 value: f,
                 unit: HashRateUnit::MegaHash,
-                algo: "SHA256".to_string(),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default())
+            .as_default_unit()
         })
     }
 }
@@ -559,6 +655,7 @@ impl GetFans for BraiinsV2505 {
 }
 
 impl GetPsuFans for BraiinsV2505 {}
+impl GetPsus for BraiinsV2505 {}
 
 impl GetFluidTemperature for BraiinsV2505 {}
 
@@ -571,14 +668,14 @@ impl GetWattage for BraiinsV2505 {
 impl GetTuningTarget for BraiinsV2505 {
     fn parse_tuning_target(&self, data: &HashMap<DataField, Value>) -> Option<TuningTarget> {
         data.get(&DataField::TuningTarget)
-            .and_then(parse_configured_tuning_target)
+            .and_then(|value| parse_configured_tuning_target(value, self.device_info.algo))
     }
 }
 
 impl GetScaledTuningTarget for BraiinsV2505 {
     fn parse_scaled_tuning_target(&self, data: &HashMap<DataField, Value>) -> Option<TuningTarget> {
         data.get(&DataField::TuningTarget)
-            .and_then(parse_scaled_tuning_target)
+            .and_then(|value| parse_scaled_tuning_target(value, self.device_info.algo))
     }
 }
 
@@ -626,6 +723,13 @@ impl GetUptime for BraiinsV2505 {
         data.extract_map::<u64, _>(DataField::Uptime, Duration::from_secs)
     }
 }
+
+impl GetBestShare for BraiinsV2505 {}
+impl GetSessionBestShare for BraiinsV2505 {}
+
+impl GetOperatingState for BraiinsV2505 {}
+
+impl GetDevFeeConnected for BraiinsV2505 {}
 
 impl GetIsMining for BraiinsV2505 {
     fn parse_is_mining(&self, data: &HashMap<DataField, Value>) -> bool {
@@ -677,6 +781,7 @@ impl GetPools for BraiinsV2505 {
                             url,
                             accepted_shares,
                             rejected_shares,
+                            last_share_time: None,
                             active,
                             alive,
                             user,
@@ -756,11 +861,10 @@ impl SetPowerLimit for BraiinsV2505 {
             }
         }"#;
         let variables = json!({ "limit": limit.as_watts() as u64 });
-        Ok(self
-            .graphql
+        self.graphql
             .send_command(mutation, true, Some(variables))
-            .await
-            .is_ok())
+            .await?;
+        Ok(true)
     }
     fn supports_set_power_limit(&self) -> bool {
         true
@@ -875,6 +979,19 @@ impl FactoryReset for BraiinsV2505 {
         true
     }
 }
+
+#[async_trait]
+impl RestartMining for BraiinsV2505 {
+    async fn restart_mining(&self) -> anyhow::Result<bool> {
+        self.graphql.restart_bosminer().await
+    }
+
+    fn supports_restart_mining(&self) -> bool {
+        true
+    }
+}
+
+impl RestoreStockOs for BraiinsV2505 {}
 
 #[async_trait]
 impl SupportsPoolsConfig for BraiinsV2505 {
@@ -1013,6 +1130,8 @@ impl SupportsTemperatureConfig for BraiinsV2505 {}
 impl GetTuningPercent for BraiinsV2505 {}
 impl SetTuningPercent for BraiinsV2505 {}
 
+impl SupportsPresets for BraiinsV2505 {}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -1031,6 +1150,20 @@ mod tests {
     /// GraphQL client strips before returning. Strip it here to match.
     fn gql(raw: &str) -> Value {
         Value::from_str(raw).unwrap()["data"].clone()
+    }
+
+    #[tokio::test]
+    async fn restore_stock_os_is_unsupported_on_braiins_v25_05() {
+        let miner = BraiinsV2505::new(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S21Plus);
+
+        assert!(miner.supports_factory_reset());
+        assert!(!miner.supports_restore_stock_os());
+        let error = miner.restore_stock_os().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Restoring the stock OS is not supported")
+        );
     }
 
     #[tokio::test]

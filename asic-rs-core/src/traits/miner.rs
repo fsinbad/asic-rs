@@ -14,8 +14,10 @@ use crate::{
         collector::{ConfigCollector, ConfigField, ConfigLocation},
         fan::FanConfig,
         pools::PoolGroupConfig,
+        preset::PresetInfo,
         scaling::ScalingConfig,
         temperature::TemperatureConfig,
+        timezone::TimezoneConfig,
         tuning::TuningConfig,
     },
     data::{
@@ -25,11 +27,13 @@ use crate::{
         command::MinerCommand,
         device::DeviceInfo,
         fan::FanData,
-        firmware::FirmwareImage,
+        firmware::{FirmwareImage, FirmwareStats, RestoreStockOsResult},
         hashrate::{HashRate, HashRateUnit},
         message::MinerMessage,
-        miner::{MinerData, TuningTarget},
+        miner::{CheckedMinerData, MinerData, NoTelemetryError, TuningTarget},
+        operating_state::OperatingState,
         pool::PoolGroupData,
+        psu::PsuData,
     },
     traits::firmware::MinerFirmware,
     traits::model::MinerModel,
@@ -45,7 +49,14 @@ pub trait MinerConstructor {
 
 #[async_trait]
 pub trait Miner:
-    GetMinerData + HasMinerControl + SupportsConfigs + UpgradeFirmware + HasAuth + HasDefaultAuth
+    GetMinerData
+    + HasMinerControl
+    + SupportsConfigs
+    + SupportsPresets
+    + UpgradeFirmware
+    + RestoreStockOs
+    + HasAuth
+    + HasDefaultAuth
 {
     async fn revalidate(&self) -> anyhow::Result<bool>;
 }
@@ -55,7 +66,9 @@ impl<
     T: GetMinerData
         + HasMinerControl
         + SupportsConfigs
+        + SupportsPresets
         + UpgradeFirmware
+        + RestoreStockOs
         + Validate
         + HasAuth
         + HasDefaultAuth,
@@ -71,8 +84,10 @@ impl<
 pub trait HasMinerControl:
     SetFaultLight
     + SetPowerLimit
+    + SetHashboardsEnabled
     + SetTuningPercent
     + Restart
+    + RestartMining
     + Resume
     + Pause
     + ChangePassword
@@ -84,8 +99,10 @@ pub trait HasMinerControl:
 impl<
     T: SetFaultLight
         + SetPowerLimit
+        + SetHashboardsEnabled
         + SetTuningPercent
         + Restart
+        + RestartMining
         + Resume
         + Pause
         + ChangePassword
@@ -102,6 +119,7 @@ pub trait SupportsConfigs:
     + SupportsTemperatureConfig
     + SupportsTuningConfig
     + SupportsFanConfig
+    + SupportsTimezoneConfig
 {
 }
 
@@ -111,7 +129,8 @@ impl<
         + SupportsScalingConfig
         + SupportsTemperatureConfig
         + SupportsTuningConfig
-        + SupportsFanConfig,
+        + SupportsFanConfig
+        + SupportsTimezoneConfig,
 > SupportsConfigs for T
 {
 }
@@ -154,6 +173,7 @@ pub trait GetMinerData:
     + GetExpectedHashrate
     + GetFans
     + GetPsuFans
+    + GetPsus
     + GetFluidTemperature
     + GetWattage
     + GetTuningPercent
@@ -164,7 +184,11 @@ pub trait GetMinerData:
     + GetMessages
     + GetUptime
     + GetIsMining
+    + GetOperatingState
+    + GetDevFeeConnected
     + GetPools
+    + GetBestShare
+    + GetSessionBestShare
 {
     /// Asynchronously retrieves standardized information about a miner,
     /// returning it as a `MinerData` struct.
@@ -173,6 +197,14 @@ pub trait GetMinerData:
     /// returning it as a `MinerData` struct.  Removes and data fields
     /// that are added to the exclude list to save data.
     async fn get_data_filtered(&self, exclude: Vec<DataField>) -> MinerData;
+    /// Collect telemetry with per-field read status. An empty collection is an
+    /// error instead of a newly timestamped snapshot of defaults.
+    async fn get_data_checked(&self) -> Result<CheckedMinerData, NoTelemetryError>;
+    /// Checked telemetry read, excluding selected fields to limit API calls.
+    async fn get_data_checked_filtered(
+        &self,
+        exclude: Vec<DataField>,
+    ) -> Result<CheckedMinerData, NoTelemetryError>;
     fn parse_data(&self, data: HashMap<DataField, Value>) -> MinerData;
 }
 
@@ -214,6 +246,7 @@ impl<
         + GetExpectedHashrate
         + GetFans
         + GetPsuFans
+        + GetPsus
         + GetFluidTemperature
         + GetWattage
         + GetTuningPercent
@@ -224,7 +257,11 @@ impl<
         + GetMessages
         + GetUptime
         + GetIsMining
+        + GetOperatingState
+        + GetDevFeeConnected
         + GetPools
+        + GetBestShare
+        + GetSessionBestShare
         + MinerInterface,
 > GetMinerData for T
 {
@@ -237,6 +274,29 @@ impl<
         all_fields.retain(|x| !exclude.contains(x));
         let data = collector.collect(all_fields.as_slice()).await;
         self.parse_data(data)
+    }
+
+    async fn get_data_checked(&self) -> Result<CheckedMinerData, NoTelemetryError> {
+        self.get_data_checked_filtered(Vec::new()).await
+    }
+
+    async fn get_data_checked_filtered(
+        &self,
+        exclude: Vec<DataField>,
+    ) -> Result<CheckedMinerData, NoTelemetryError> {
+        let mut collector = self.get_collector();
+        let mut fields = DataField::iter().collect::<Vec<_>>();
+        fields.retain(|field| !exclude.contains(field));
+        let report = collector.collect_report(&fields).await;
+        if report.values.is_empty() {
+            return Err(NoTelemetryError {
+                diagnostics: report.diagnostics,
+            });
+        }
+        Ok(CheckedMinerData {
+            data: self.parse_data(report.values),
+            diagnostics: report.diagnostics,
+        })
     }
 
     fn parse_data(&self, data: HashMap<DataField, Value>) -> MinerData {
@@ -262,11 +322,16 @@ impl<
         let outlet_fluid_temperature = self.parse_outlet_fluid_temperature(&data);
         let fans = self.parse_fans(&data);
         let psu_fans = self.parse_psu_fans(&data);
+        let psus = self.parse_psus(&data);
         let hashboards = self.parse_hashboards(&data);
         let light_flashing = self.parse_light_flashing(&data);
         let is_mining = self.parse_is_mining(&data);
+        let operating_state = self.parse_operating_state(&data);
+        let devfee_connected = self.parse_devfee_connected(&data);
         let messages = self.parse_messages(&data);
         let pools = self.parse_pools(&data);
+        let best_share = self.parse_best_share(&data);
+        let session_best_share = self.parse_session_best_share(&data);
         let device_info = self.get_device_info();
 
         // computed fields
@@ -340,6 +405,7 @@ impl<
             expected_fans: device_info.hardware.fans,
             fans,
             psu_fans,
+            psus,
             average_temperature,
             fluid_temperature,
             outlet_fluid_temperature,
@@ -357,8 +423,12 @@ impl<
             messages,
             uptime,
             is_mining,
+            operating_state,
+            devfee_connected,
 
             pools,
+            best_share,
+            session_best_share,
         }
     }
 }
@@ -598,8 +668,7 @@ pub trait GetHashrate: CollectData {
     async fn get_hashrate(&self) -> Option<HashRate> {
         let mut collector = self.get_collector();
         let data = collector.collect(&[DataField::Hashrate]).await;
-        self.parse_hashrate(&data)
-            .map(|hr| hr.as_unit(HashRateUnit::default()))
+        self.parse_hashrate(&data).map(|hr| hr.as_default_unit())
     }
     #[allow(unused_variables)]
     fn parse_hashrate(&self, data: &HashMap<DataField, Value>) -> Option<HashRate> {
@@ -615,7 +684,7 @@ pub trait GetExpectedHashrate: CollectData {
         let mut collector = self.get_collector();
         let data = collector.collect(&[DataField::ExpectedHashrate]).await;
         self.parse_expected_hashrate(&data)
-            .map(|hr| hr.as_unit(HashRateUnit::default()))
+            .map(|hr| hr.as_default_unit())
     }
     #[allow(unused_variables)]
     fn parse_expected_hashrate(&self, data: &HashMap<DataField, Value>) -> Option<HashRate> {
@@ -650,6 +719,21 @@ pub trait GetPsuFans: CollectData {
     #[allow(unused_variables)]
     fn parse_psu_fans(&self, data: &HashMap<DataField, Value>) -> Vec<FanData> {
         vec![]
+    }
+}
+
+// PSUs
+#[async_trait]
+pub trait GetPsus: CollectData {
+    #[tracing::instrument(level = "debug")]
+    async fn get_psus(&self) -> Option<Vec<PsuData>> {
+        let mut collector = self.get_collector();
+        let data = collector.collect(&[DataField::Psus]).await;
+        self.parse_psus(&data)
+    }
+    #[allow(unused_variables)]
+    fn parse_psus(&self, data: &HashMap<DataField, Value>) -> Option<Vec<PsuData>> {
+        None
     }
 }
 
@@ -823,6 +907,38 @@ pub trait GetIsMining: CollectData {
     }
 }
 
+/// Detailed state reported by firmware, never inferred from `is_mining`.
+#[async_trait]
+pub trait GetOperatingState: CollectData {
+    #[tracing::instrument(level = "debug")]
+    async fn get_operating_state(&self) -> Option<OperatingState> {
+        let mut collector = self.get_collector();
+        let data = collector.collect(&[DataField::OperatingState]).await;
+        self.parse_operating_state(&data)
+    }
+
+    #[allow(unused_variables)]
+    fn parse_operating_state(&self, data: &HashMap<DataField, Value>) -> Option<OperatingState> {
+        None
+    }
+}
+
+/// Developer-fee connection status explicitly reported by firmware.
+#[async_trait]
+pub trait GetDevFeeConnected: CollectData {
+    #[tracing::instrument(level = "debug")]
+    async fn get_devfee_connected(&self) -> Option<bool> {
+        let mut collector = self.get_collector();
+        let data = collector.collect(&[DataField::DevFeeConnected]).await;
+        self.parse_devfee_connected(&data)
+    }
+
+    #[allow(unused_variables)]
+    fn parse_devfee_connected(&self, data: &HashMap<DataField, Value>) -> Option<bool> {
+        None
+    }
+}
+
 // Pools
 #[async_trait]
 pub trait GetPools: CollectData {
@@ -835,6 +951,36 @@ pub trait GetPools: CollectData {
     #[allow(unused_variables)]
     fn parse_pools(&self, data: &HashMap<DataField, Value>) -> Vec<PoolGroupData> {
         vec![]
+    }
+}
+
+// Best share difficulty (all-time)
+#[async_trait]
+pub trait GetBestShare: CollectData {
+    #[tracing::instrument(level = "debug")]
+    async fn get_best_share(&self) -> Option<f64> {
+        let mut collector = self.get_collector();
+        let data = collector.collect(&[DataField::BestShare]).await;
+        self.parse_best_share(&data)
+    }
+    #[allow(unused_variables)]
+    fn parse_best_share(&self, data: &HashMap<DataField, Value>) -> Option<f64> {
+        None
+    }
+}
+
+// Best share difficulty (this session / since boot)
+#[async_trait]
+pub trait GetSessionBestShare: CollectData {
+    #[tracing::instrument(level = "debug")]
+    async fn get_session_best_share(&self) -> Option<f64> {
+        let mut collector = self.get_collector();
+        let data = collector.collect(&[DataField::SessionBestShare]).await;
+        self.parse_session_best_share(&data)
+    }
+    #[allow(unused_variables)]
+    fn parse_session_best_share(&self, data: &HashMap<DataField, Value>) -> Option<f64> {
+        None
     }
 }
 
@@ -857,6 +1003,24 @@ pub trait SetPowerLimit {
     fn supports_set_power_limit(&self) -> bool;
 }
 
+/// Enable or disable one or more hashboards by their zero-based position.
+#[async_trait]
+pub trait SetHashboardsEnabled {
+    #[allow(unused_variables)]
+    async fn set_hashboards_enabled(
+        &self,
+        board_indices: &[u8],
+        enabled: bool,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("Enabling or disabling hashboards is not supported on this platform");
+    }
+
+    /// Whether this backend can enable or disable individual hashboards.
+    fn supports_set_hashboards_enabled(&self) -> bool {
+        false
+    }
+}
+
 #[async_trait]
 pub trait SetTuningPercent {
     /// Set a manual tuning percent of full power (100 = unthrottled).
@@ -871,11 +1035,44 @@ pub trait SetTuningPercent {
 }
 
 #[async_trait]
+pub trait SupportsPresets {
+    /// List the firmware's available autotune/overclock presets.
+    ///
+    /// Selecting a preset is done through [`SupportsTuningConfig::set_tuning_config`]
+    /// with a [`TuningTarget::Preset`], and the active preset is surfaced via
+    /// [`GetTuningTarget::get_tuning_target`].
+    async fn get_presets(&self) -> Vec<PresetInfo> {
+        Vec::new()
+    }
+    /// Defaults to `false`; backends with named presets override this.
+    fn supports_presets(&self) -> bool {
+        false
+    }
+}
+
+#[async_trait]
 pub trait Restart {
     async fn restart(&self) -> anyhow::Result<bool> {
         anyhow::bail!("Restarting is not supported on this platform");
     }
     fn supports_restart(&self) -> bool;
+}
+
+/// Restart the mining program without rebooting the operating system.
+///
+/// This is distinct from [`Restart`], which reboots the whole device. A
+/// successful request only confirms that the firmware accepted the restart;
+/// hashing stops while the mining program comes back up.
+#[async_trait]
+pub trait RestartMining {
+    async fn restart_mining(&self) -> anyhow::Result<bool> {
+        anyhow::bail!("Restarting the mining program is not supported on this platform");
+    }
+    /// Defaults to `false`; backends that can restart the mining program
+    /// without a reboot override this.
+    fn supports_restart_mining(&self) -> bool {
+        false
+    }
 }
 
 #[async_trait]
@@ -907,11 +1104,32 @@ pub trait ChangePassword {
 
 #[async_trait]
 pub trait FactoryReset {
+    /// Restore the miner's settings to their factory defaults.
+    ///
+    /// This does not replace or uninstall the currently running operating
+    /// system. Use [`RestoreStockOs::restore_stock_os`] to remove an
+    /// aftermarket OS and restore the manufacturer OS.
     #[allow(unused_variables)]
     async fn factory_reset(&self) -> anyhow::Result<bool> {
         anyhow::bail!("Factory resetting is not supported on this platform");
     }
     fn supports_factory_reset(&self) -> bool;
+}
+
+/// Uninstall an aftermarket miner OS and restore the manufacturer stock OS.
+///
+/// This is distinct from [`FactoryReset`], which only restores settings. A
+/// successful request generally starts a background restore; it does not mean
+/// that the device has completed restoring or rebooting.
+#[async_trait]
+pub trait RestoreStockOs {
+    async fn restore_stock_os(&self) -> anyhow::Result<RestoreStockOsResult> {
+        anyhow::bail!("Restoring the stock OS is not supported on this platform");
+    }
+
+    fn supports_restore_stock_os(&self) -> bool {
+        false
+    }
 }
 
 #[async_trait]
@@ -925,12 +1143,40 @@ pub trait ReadLogs {
 
 #[async_trait]
 pub trait UpgradeFirmware {
+    /// Validate and resolve a firmware image without uploading it.
+    ///
+    /// Backends with container formats can use read-only miner metadata to
+    /// select a compatible payload. The returned image is the exact filename
+    /// and bytes that the backend would pass to its upload implementation.
+    #[allow(unused_variables)]
+    async fn prepare_firmware(&self, image: FirmwareImage) -> anyhow::Result<FirmwareImage> {
+        anyhow::bail!("Preparing firmware is not supported on this platform");
+    }
+
+    /// Whether this backend provides non-mutating firmware preparation.
+    fn supports_prepare_firmware(&self) -> bool {
+        false
+    }
+
     #[allow(unused_variables)]
     async fn upgrade_firmware(&self, image: FirmwareImage) -> anyhow::Result<bool> {
         anyhow::bail!("Upgrading firmware is not supported on this platform");
     }
 
     fn supports_upgrade_firmware(&self) -> bool {
+        false
+    }
+
+    /// Check whether a newer firmware is available for this miner.
+    ///
+    /// This is an on-demand call (it typically queries the vendor's release
+    /// server), not part of the regular telemetry poll. Defaults to
+    /// unsupported.
+    async fn check_firmware_update(&self) -> anyhow::Result<FirmwareStats> {
+        anyhow::bail!("Checking for firmware updates is not supported on this platform");
+    }
+
+    fn supports_check_firmware_update(&self) -> bool {
         false
     }
 }
@@ -964,6 +1210,13 @@ pub trait SupportsScalingConfig: CollectConfigs {
     #[allow(unused_variables)]
     async fn set_scaling_config(&self, config: ScalingConfig) -> anyhow::Result<bool> {
         anyhow::bail!("Setting scaling config is not supported on this platform");
+    }
+    /// Clear the active scaling state and restart tuning at its configured target.
+    async fn reset_scaling(&self) -> anyhow::Result<bool> {
+        anyhow::bail!("Resetting scaling is not supported on this platform");
+    }
+    fn supports_reset_scaling(&self) -> bool {
+        false
     }
     #[tracing::instrument(level = "debug")]
     async fn get_scaling_config(&self) -> anyhow::Result<ScalingConfig> {
@@ -1003,6 +1256,31 @@ pub trait SupportsTemperatureConfig: CollectConfigs {
     }
     /// Defaults to `false`; backends that report configured thermal limits override this.
     fn supports_temperature_config(&self) -> bool {
+        false
+    }
+}
+
+#[async_trait]
+pub trait SupportsTimezoneConfig: CollectConfigs {
+    #[allow(unused_variables)]
+    async fn set_timezone_config(&self, config: TimezoneConfig) -> anyhow::Result<bool> {
+        anyhow::bail!("Setting timezone config is not supported on this platform");
+    }
+    #[tracing::instrument(level = "debug")]
+    async fn get_timezone_config(&self) -> anyhow::Result<TimezoneConfig> {
+        let mut collector = self.get_config_collector();
+        let data = collector.collect(&[ConfigField::Timezone]).await;
+        self.parse_timezone_config(&data)
+    }
+    #[allow(unused_variables)]
+    fn parse_timezone_config(
+        &self,
+        data: &HashMap<ConfigField, Value>,
+    ) -> anyhow::Result<TimezoneConfig> {
+        anyhow::bail!("Getting timezone config is not supported on this platform");
+    }
+
+    fn supports_timezone_config(&self) -> bool {
         false
     }
 }

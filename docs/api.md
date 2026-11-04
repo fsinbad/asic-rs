@@ -1,12 +1,25 @@
 # API Guide
 
-The Rust and Python APIs intentionally share names and behavior. This page
+The Rust, Python, and Go APIs intentionally share names and behavior. This page
 summarizes the user-facing surface and points out the few language-specific
-differences.
+differences. Go methods are synchronous and return `error`; a missing miner is
+`asic_go.ErrNotFound`. See `go/README.md` for cgo build notes.
 
 ## Discovery
 
-`MinerFactory` owns the scan range and discovery tuning.
+`MinerFactory` owns the scan range and discovery tuning. Connectivity retries
+are additional attempts after the initial probe. Setting retries to zero still
+performs one probe; later attempts use bounded exponential backoff and remain
+under the same scan concurrency limit. The default remains three retries;
+callers that want one pass can explicitly set zero.
+
+Common miner ports are probed concurrently, returning after the first success.
+The scan concurrency limit also bounds the total number of active TCP probes,
+including probes made by connectivity retries.
+
+The identification timeout is an end-to-end deadline covering discovery
+commands and firmware-specific miner construction. Discovery HTTP clients also
+apply explicit connection and total-request deadlines.
 
 === "Rust"
 
@@ -14,6 +27,7 @@ differences.
     let factory = MinerFactory::from_subnet("192.168.1.0/24")?
         .with_concurrent_limit(2500)
         .with_connectivity_timeout_secs(1)
+        .with_connectivity_retries(0)
         .with_identification_timeout_secs(10);
     ```
 
@@ -24,30 +38,53 @@ differences.
         MinerFactory.from_subnet("192.168.1.0/24")
         .with_concurrent_limit(2500)
         .with_connectivity_timeout_secs(1)
+        .with_connectivity_retries(0)
         .with_identification_timeout_secs(10)
     )
     ```
 
-| Operation | Rust | Python |
-| --- | --- | --- |
-| Known IP | `get_miner(ip).await?` | `await get_miner(ip)` |
-| Full scan | `scan().await?` | `await scan()` |
-| Stream found miners | `scan_stream()` | `scan_stream()` |
-| Stream every IP | `scan_stream_with_ip()` | `scan_stream_with_ip()` |
+=== "Go"
+
+    ```go
+    factory, err := asic_go.NewMinerFactoryFromSubnet("192.168.1.0/24")
+    if err != nil {
+        log.Fatal(err)
+    }
+    factory.WithConcurrentLimit(2500).
+        WithConnectivityTimeoutSecs(1).
+        WithConnectivityRetries(0).
+        WithIdentificationTimeoutSecs(10)
+    ```
+
+| Operation | Rust | Python | Go |
+| --- | --- | --- | --- |
+| Known IP | `get_miner(ip).await?` | `await get_miner(ip)` | `GetMiner(ip)` |
+| Full scan | `scan().await?` | `await scan()` | `Scan()` |
+| Stream found miners | `scan_stream()` | `scan_stream()` | not wrapped yet |
+| Stream every IP | `scan_stream_with_ip()` | `scan_stream_with_ip()` | not wrapped yet |
 
 ## Miner Identity
 
 Miner identity is available without awaiting because it is known when the miner
 handle is constructed.
 
-| Value | Rust | Python |
-| --- | --- | --- |
-| IP address | `miner.get_ip()` | `miner.ip` |
-| Make | `miner.get_device_info().make` | `miner.make` |
-| Model | `miner.get_device_info().model` | `miner.model` |
-| Firmware | `miner.get_device_info().firmware` | `miner.firmware` |
-| Algorithm | `miner.get_device_info().algo` | `miner.algo` |
-| Hardware shape | `miner.get_device_info().hardware` | `miner.hardware` |
+In Go, retrieve the identity and handle its error before reading fields:
+
+```go
+info, err := miner.GetDeviceInfo()
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+| Value | Rust | Python | Go |
+| --- | --- | --- | --- |
+| IP address | `miner.get_ip()` | `miner.ip` | `miner.GetIP()` |
+| Make | `miner.get_device_info().make` | `miner.make` | `info.Make` |
+| Model | `miner.get_device_info().model` | `miner.model` | `info.Model` |
+| Firmware | `miner.get_device_info().firmware` | `miner.firmware` | `info.Firmware` |
+| Algorithm | `miner.get_device_info().algo` | `miner.algo` | `info.Algo` |
+| Hardware shape | `miner.get_device_info().hardware` | `miner.hardware` | `info.Hardware` |
 
 ## Data Collection
 
@@ -70,6 +107,17 @@ fields when a caller does not need the whole snapshot.
     fans = await miner.get_fans()
     ```
 
+=== "Go"
+
+    ```go
+    data, err := miner.GetData()
+    if err != nil {
+        log.Fatal(err)
+    }
+    hashrate, err := miner.GetHashrate()
+    fans, err := miner.GetFans()
+    ```
+
 Common telemetry methods:
 
 | Field | Method |
@@ -81,19 +129,32 @@ Common telemetry methods:
 | Hashboards | `get_hashboards` |
 | Hashrate | `get_hashrate` |
 | Fans | `get_fans` |
+| Power supplies | `get_psus` |
 | Wattage | `get_wattage` |
+| Best share difficulty | `get_best_share` |
+| Session best share difficulty | `get_session_best_share` |
 | Messages | `get_messages` |
 | Pools | `get_pools` |
 | Mining state | `get_is_mining` |
 
+`MinerData.psus` is `Option<Vec<PsuData>>`: `None` when the firmware does not
+report PSU details, otherwise one entry per PSU with model, serial number,
+firmware version, input/output voltage (V), output current (A), input/output
+power (W), efficiency (0–1), and temperature (°C). Custom Rust backends
+implement `GetPsus`; an empty implementation reports `None`. SealMiner Stock
+reads these from RPC `stats` (`PSU Input Voltage`, `PSU Output Current`, …) and
+also reports its non-zero `PSU Error` bitmask as a `PowerSupply` message.
+
 ## Controls And Capability Checks
 
 Not every miner supports every control. Rust exposes `supports_*()` methods;
-Python exposes matching `supports_*` properties.
+Python exposes matching `supports_*` properties; Go returns them from
+`Supports()`.
 
 | Capability | Control |
 | --- | --- |
 | `supports_restart` | `restart()` |
+| `supports_restart_mining` | `restart_mining()` |
 | `supports_pause` | `pause()` |
 | `supports_resume` | `resume()` |
 | `supports_set_fault_light` | `set_fault_light(...)` |
@@ -101,11 +162,49 @@ Python exposes matching `supports_*` properties.
 | `supports_change_password` | `change_password(...)` |
 | `supports_read_logs` | `read_logs()` |
 | `supports_factory_reset` | `factory_reset()` |
+| `supports_restore_stock_os` | `restore_stock_os()` |
+| `supports_prepare_firmware` | `prepare_firmware(...)` |
 | `supports_upgrade_firmware` | `upgrade_firmware(...)` |
+| `supports_check_firmware_update` | `check_firmware_update()` |
 
 All miner handles also expose `revalidate()`, which re-runs that backend's
 firmware discovery checks against the same IP and returns whether the device is
 still valid for the existing miner handle.
+
+`prepare_firmware(...)` is read-only. It validates backend-specific containers
+and may query miner metadata to select a compatible payload, but it never starts
+an upload. The returned `FirmwareImage` contains the filename and bytes that an
+upgrade would use.
+
+`check_firmware_update()` is an on-demand, read-only check returning installed
+and latest versions and, when resolved, a firmware download source. Braiins
+v26.04 queries the miner's update service. ePIC queries GitHub's latest release
+API, using `epicblockchain/powerplay-antminer` for STM32 UMC boards and
+`epicblockchain/umcos-antminer` for recognized stock control boards. Unknown
+ePIC board identities and legacy VolcMiner Xilinx boards return an error.
+ePIC currently reports versions only;
+the download source is absent because board/model asset selection is not yet
+implemented. GitHub checks require internet access and are subject to its public
+API rate limits. An unknown installed version makes `update_available()` return
+`false`, even if the latest version is known.
+ePIC shares concurrent GitHub lookups per repository and caches valid release
+metadata for five minutes. Failed lookups are cached for one minute before a
+retry, avoiding repeated requests during outages or rate limiting. Installed
+versions are always read from each miner and are never shared through this cache.
+
+For any backend with `supports_check_firmware_update() == true`, use the
+returned `FirmwareStats::update_available()` to compare versions:
+
+```rust
+let stats = miner.check_firmware_update().await?;
+let update_available = stats.update_available();
+```
+
+`factory_reset()` restores the miner's settings to their factory defaults; it
+does not replace the installed operating system. `restore_stock_os()` is a
+separate, disruptive operation that uninstalls an aftermarket OS and restores
+the manufacturer's stock OS. A successful request may reboot the miner and
+does not mean the restore has already completed.
 
 === "Rust"
 
@@ -120,6 +219,21 @@ still valid for the existing miner handle.
     ```python
     if miner.supports_set_power_limit:
         await miner.set_power_limit(3200.0)
+    ```
+
+=== "Go"
+
+    ```go
+    caps, err := miner.Supports()
+    if err != nil {
+        log.Fatal(err)
+    }
+    if caps.SetPowerLimit {
+        _, err := miner.SetPowerLimit(3200.0)
+        if err != nil {
+            log.Fatal(err)
+        }
+    }
     ```
 
 ## Configuration Models
@@ -149,6 +263,16 @@ are backed by Rust structs and expose Pydantic-style helpers.
         }],
     };
     ```
+
+Rust pool configs can add an exact worker suffix without storing it in the config model:
+
+```rust
+let with_suffix = pool.use_worker_suffix(".device-1");
+let account_only = with_suffix.clear_worker_suffix();
+```
+
+The suffix passed to `use_worker_suffix` includes the separator. Clearing keeps the account name
+before the first dot, even when the worker name contains more dots.
 
 === "Python"
 
@@ -201,3 +325,51 @@ Python data/config classes can be used inside Pydantic models and support
 
     print(snapshot.model_dump())
     ```
+
+## Binding Names And Wire Formats
+
+Shared type names are retained in Go: `MinerFactory`, `DeviceInfo`,
+`MinerHardware`, `HashAlgorithm`, `MiningMode`, `MinerControlBoard`,
+`MinerComponent`, and the tuning-capability models. Go exports names in
+PascalCase, retaining initialisms (`IP`, `MAC`, `API`, `PSU`). Identity and
+telemetry getters consistently use `Get…`; constructors use `New…` followed
+by the type and, where needed, the variant.
+
+Python additionally exports `PoolConfig` and `PoolGroupConfig` as aliases for
+its existing `Pool` and `PoolGroup` classes. `MinerHardware.total_chips` is the
+shared count name; Python's `chips` property remains an alias. Go exposes
+`TotalChips`, `BoardCount`, and `ChipsForBoard`, returning a value and a boolean
+that distinguishes missing counts from zero.
+
+Go tuning targets expose `Variant`, `Watts`, `TargetHashrate`, `TargetMode`,
+`PresetName`, and `Boards`. These correspond to Python's `variant`, `watts`,
+`target_hashrate`, `target_mode`, `preset_name`, and `boards`. `ManualTuningValues`
+uses numeric board IDs in Go, Rust, and Python. The complete Go constructor set
+is `NewTuningTargetManual`, `NewTuningTargetPower`, `NewTuningTargetHashrate`,
+`NewTuningTargetMiningMode`, and `NewTuningTargetPreset`.
+
+Some established Python representations differ from Rust's Serde schema.
+The C bridge and Go JSON output retain the Rust schema, also described by the
+Rust TypeScript derives; they do not rename existing wire fields.
+
+| Value | Rust / C / Go JSON output | Existing Python representation |
+| --- | --- | --- |
+| Hashrate unit | `"TeraHash"` | `"TH/s"` |
+| Pool scheme | `"StratumV1"` | `"stratum+tcp"` |
+| Pool URL | Object containing scheme/host/port/pubkey | URL string |
+| Fan mode | `"Auto"` / `"Manual"` | `"auto"` / `"manual"` |
+| Power target | `{"Power":{"watts":3200}}` | `{"type":"power","value":3200}` |
+| Mining-mode target | `{"MiningMode":"High"}` | `{"type":"mode","value":"High"}` |
+
+Go accepts these Python input forms for hash units, pool schemes/URLs, fan modes,
+and tuning targets, then emits canonical Rust JSON. Invalid hash units and
+algorithms return errors instead of silently becoming hashes per second or
+SHA-256. `HashRate.DefaultUnit` and `IntoDefaultUnit` use the algorithm-specific
+unit, matching Rust/Python.
+
+`Supports()` and `Expected()` remain Go conveniences for grouped results;
+individual `GetExpectedHashboards`, `GetExpectedChips`, and `GetExpectedFans`
+methods also match the shared API. Go's `GetControlBoardVersion` and the snapshot
+both preserve `{known, name}`; Python's established individual getter continues
+to return a display string. Go firmware checks and revalidation propagate backend
+errors, whereas the existing Python methods return `None` for those failures.

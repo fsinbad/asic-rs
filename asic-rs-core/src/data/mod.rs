@@ -13,5 +13,8 @@ pub mod firmware;
 pub mod hashrate;
 pub mod message;
 pub mod miner;
+pub mod operating_state;
 pub mod pool;
+pub mod psu;
 pub(crate) mod serialize;
+pub mod share;

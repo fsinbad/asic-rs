@@ -7,6 +7,7 @@ use asic_rs_core::{
         fan::FanConfig,
         pools::{PoolConfig, PoolGroupConfig},
         scaling::ScalingConfig,
+        timezone::{TimezoneConfig, Tz},
         tuning::TuningConfig,
     },
     data::{
@@ -17,10 +18,11 @@ use asic_rs_core::{
         command::MinerCommand,
         device::{DeviceInfo, HashAlgorithm},
         fan::FanData,
-        firmware::FirmwareImage,
+        firmware::{FirmwareImage, FirmwareStats, RestoreStockOsResult},
         hashrate::{HashRate, HashRateUnit},
         message::{MessageSeverity, MinerMessage},
         miner::TuningTarget,
+        operating_state::OperatingState,
         pool::{PoolData, PoolGroupData, PoolURL},
     },
     traits::{miner::*, model::MinerModel},
@@ -34,10 +36,12 @@ use macaddr::MacAddr;
 use measurements::{AngularVelocity, Frequency, Power, Temperature, Voltage};
 use reqwest::Method;
 use serde_json::{Value, json};
+use tokio::sync::OnceCell;
 use web::PowerPlayWebAPI;
 
 use crate::firmware::EPicFirmware;
 
+mod releases;
 mod web;
 
 #[derive(Debug)]
@@ -45,6 +49,7 @@ pub struct PowerPlayV1 {
     ip: IpAddr,
     web: PowerPlayWebAPI,
     device_info: DeviceInfo,
+    restore_stock_os_supported: OnceCell<bool>,
 }
 
 impl PowerPlayV1 {
@@ -55,7 +60,26 @@ impl PowerPlayV1 {
             ip,
             web: PowerPlayWebAPI::new(ip, 4028, auth),
             device_info: DeviceInfo::new(model, EPicFirmware::default(), hash_algorithm),
+            restore_stock_os_supported: OnceCell::new(),
         }
+    }
+
+    #[cfg(test)]
+    fn new_with_port(ip: IpAddr, model: impl MinerModel, port: u16) -> Self {
+        let mut miner = Self::new(ip, model);
+        miner.web = PowerPlayWebAPI::new(ip, port, Self::default_auth());
+        miner
+    }
+
+    pub(crate) fn set_restore_stock_os_support(&mut self, supported: bool) {
+        self.restore_stock_os_supported = OnceCell::new_with(Some(supported));
+    }
+
+    async fn restore_stock_os_support(&self) -> anyhow::Result<bool> {
+        self.restore_stock_os_supported
+            .get_or_try_init(|| self.web.supports_uninstall())
+            .await
+            .copied()
     }
 
     fn coin_type_for_hash_algorithm(hash_algorithm: HashAlgorithm) -> &'static str {
@@ -98,6 +122,167 @@ impl PowerPlayV1 {
         pools
     }
 
+    fn parse_pool_url(value: &Value) -> Option<PoolURL> {
+        value.as_str().and_then(|s| {
+            if s.is_empty() {
+                None
+            } else {
+                Some(PoolURL::from(s.to_string()))
+            }
+        })
+    }
+
+    fn parse_pool_user(value: &Value) -> Option<String> {
+        value.as_str().map(String::from)
+    }
+
+    fn pool_data_from_config(position: Option<u16>, config: &Value) -> PoolData {
+        PoolData {
+            position,
+            url: config.get("pool").and_then(Self::parse_pool_url),
+            accepted_shares: None,
+            rejected_shares: None,
+            last_share_time: None,
+            active: Some(false),
+            alive: None,
+            user: config.get("login").and_then(Self::parse_pool_user),
+        }
+    }
+
+    fn apply_pool_status(
+        pool: &mut PoolData,
+        status: &Value,
+        pool_key: &str,
+        user_key: &str,
+        accepted_key: &str,
+        rejected_key: &str,
+        alive_key: &str,
+    ) {
+        pool.active = Some(true);
+        pool.alive = status.get(alive_key).and_then(Value::as_bool);
+        pool.user = status.get(user_key).and_then(Self::parse_pool_user);
+        pool.url = status.get(pool_key).and_then(Self::parse_pool_url);
+        pool.accepted_shares = status.get(accepted_key).and_then(Value::as_u64);
+        pool.rejected_shares = status.get(rejected_key).and_then(Value::as_u64);
+    }
+
+    fn parse_hashrate_split_pools(
+        pools_object: &serde_json::Map<String, Value>,
+    ) -> Vec<PoolGroupData> {
+        let statuses = pools_object
+            .get("Hashratesplit Status")
+            .and_then(Value::as_array);
+
+        let mut groups: Vec<PoolGroupData> = pools_object
+            .get("Hashratesplit Config")
+            .and_then(|v| v.get("hashrate_splits"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(group_idx, split)| {
+                let active_index = split
+                    .get("sc_index")
+                    .and_then(Value::as_u64)
+                    .and_then(|idx| u16::try_from(idx).ok());
+                let status = statuses.and_then(|statuses| statuses.get(group_idx));
+                let name = format!("group{}", group_idx + 1);
+                let quota = split
+                    .get("ratio")
+                    .and_then(Value::as_u64)
+                    .and_then(|ratio| u32::try_from(ratio).ok())
+                    .unwrap_or(1);
+                let pools = split
+                    .get("stratum_configs")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                    .map(|(pool_idx, config)| {
+                        let position = u16::try_from(pool_idx).ok();
+                        let active = position == active_index;
+
+                        let mut pool = Self::pool_data_from_config(position, config);
+                        pool.active = Some(active);
+
+                        if active && let Some(status) = status {
+                            Self::apply_pool_status(
+                                &mut pool,
+                                status,
+                                "pool",
+                                "login",
+                                "shares_accepted",
+                                "shares_rejected",
+                                "is_stratum_connected",
+                            );
+
+                            pool.url = pool
+                                .url
+                                .or_else(|| config.get("pool").and_then(Self::parse_pool_url));
+                            pool.user = pool
+                                .user
+                                .or_else(|| config.get("login").and_then(Self::parse_pool_user));
+                        }
+
+                        pool
+                    })
+                    .collect();
+
+                PoolGroupData { name, quota, pools }
+            })
+            .collect();
+
+        groups.truncate(3);
+        groups
+    }
+
+    fn parse_standard_pools(pools_object: &serde_json::Map<String, Value>) -> Vec<PoolGroupData> {
+        let mut pools_vec: Vec<PoolData> = Vec::new();
+
+        if let Some(configs) = pools_object
+            .get("StratumConfigs")
+            .and_then(|v| v.as_array())
+        {
+            for (idx, config) in configs.iter().enumerate() {
+                pools_vec.push(Self::pool_data_from_config(Some(idx as u16), config));
+            }
+        }
+
+        if let Some(stratum) = pools_object.get("Stratum") {
+            for pool in pools_vec.iter_mut() {
+                if pool.position
+                    == stratum
+                        .get("Config Id")
+                        .and_then(|v| v.as_u64().map(|v| v as u16))
+                {
+                    Self::apply_pool_status(
+                        pool,
+                        stratum,
+                        "Current Pool",
+                        "Current User",
+                        "Accepted",
+                        "Rejected",
+                        "IsPoolConnected",
+                    );
+
+                    if let Some(session) = pools_object.get("Session").and_then(|v| v.as_object()) {
+                        pool.accepted_shares = session.get("Accepted").and_then(|v| v.as_u64());
+                        pool.rejected_shares = session.get("Rejected").and_then(|v| v.as_u64());
+                        pool.last_share_time = session
+                            .get("Last Accepted Share Timestamp")
+                            .and_then(asic_rs_core::util::parse_last_share_time);
+                    }
+                }
+            }
+        }
+
+        vec![PoolGroupData {
+            name: String::new(),
+            quota: 1,
+            pools: pools_vec,
+        }]
+    }
+
     fn to_stratum_configs(group: &PoolGroupConfig) -> Vec<Value> {
         group
             .pools
@@ -119,9 +304,54 @@ impl APIClient for PowerPlayV1 {
         match command {
             MinerCommand::WebAPI { .. } => self.web.get_api_result(command).await,
             _ => Err(anyhow::anyhow!(
-                "Unsupported command type for ePIC PowerPlay API"
+                "Unsupported command type for {} API",
+                EPicFirmware::default()
             )),
         }
+    }
+}
+
+#[async_trait]
+impl SetHashboardsEnabled for PowerPlayV1 {
+    async fn set_hashboards_enabled(
+        &self,
+        board_indices: &[u8],
+        enabled: bool,
+    ) -> anyhow::Result<bool> {
+        if board_indices.is_empty() {
+            return Ok(true);
+        }
+
+        let boards = board_indices
+            .iter()
+            .map(|index| json!({ "Index": index, "Data": enabled }))
+            .collect::<Vec<_>>();
+        let response = self
+            .web
+            .send_command(
+                "boardenable",
+                false,
+                Some(json!({ "param": boards })),
+                Method::POST,
+            )
+            .await?;
+
+        match response.get("result").and_then(Value::as_bool) {
+            Some(true) => Ok(true),
+            Some(false) => {
+                let error = response
+                    .get("error")
+                    .filter(|error| !error.is_null())
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "unknown error".to_string());
+                anyhow::bail!("ePIC rejected hashboard state change: {error}");
+            }
+            None => anyhow::bail!("Invalid ePIC boardenable response: missing boolean result"),
+        }
+    }
+
+    fn supports_set_hashboards_enabled(&self) -> bool {
+        true
     }
 }
 
@@ -133,6 +363,10 @@ impl GetConfigsLocations for PowerPlayV1 {
         };
         const WEB_HASHRATESPLIT_CONFIG: MinerCommand = MinerCommand::WebAPI {
             command: "hashratesplit/config",
+            parameters: None,
+        };
+        const WEB_TIMEZONE: MinerCommand = MinerCommand::WebAPI {
+            command: "timezone",
             parameters: None,
         };
         match data_field {
@@ -158,7 +392,7 @@ impl GetConfigsLocations for PowerPlayV1 {
                     ConfigExtractor {
                         func: get_by_pointer,
                         key: Some(""),
-                        tag: Some("hashratesplit"),
+                        tag: Some("Hashratesplit Config"),
                     },
                 ),
             ],
@@ -172,6 +406,14 @@ impl GetConfigsLocations for PowerPlayV1 {
             )],
             ConfigField::Tuning => vec![(
                 WEB_SUMMARY,
+                ConfigExtractor {
+                    func: get_by_pointer,
+                    key: Some(""),
+                    tag: None,
+                },
+            )],
+            ConfigField::Timezone => vec![(
+                WEB_TIMEZONE,
                 ConfigExtractor {
                     func: get_by_pointer,
                     key: Some(""),
@@ -221,6 +463,14 @@ impl GetDataLocations for PowerPlayV1 {
         };
         const WEB_TEMPS: MinerCommand = MinerCommand::WebAPI {
             command: "temps",
+            parameters: None,
+        };
+        const WEB_HASHRATESPLIT_CONFIG: MinerCommand = MinerCommand::WebAPI {
+            command: "hashratesplit/config",
+            parameters: None,
+        };
+        const WEB_HASHRATESPLIT_STATUS: MinerCommand = MinerCommand::WebAPI {
+            command: "hashratesplit/status",
             parameters: None,
         };
 
@@ -333,19 +583,53 @@ impl GetDataLocations for PowerPlayV1 {
                     },
                 ),
             ],
-            DataField::Pools => vec![(
-                WEB_SUMMARY,
-                DataExtractor {
-                    func: get_by_pointer,
-                    key: Some(""),
-                    tag: None,
-                },
-            )],
+            DataField::Pools => vec![
+                (
+                    WEB_SUMMARY,
+                    DataExtractor {
+                        func: get_by_pointer,
+                        key: Some(""),
+                        tag: None,
+                    },
+                ),
+                (
+                    WEB_HASHRATESPLIT_CONFIG,
+                    DataExtractor {
+                        func: get_by_pointer,
+                        key: Some(""),
+                        tag: Some("Hashratesplit Config"),
+                    },
+                ),
+                (
+                    WEB_HASHRATESPLIT_STATUS,
+                    DataExtractor {
+                        func: get_by_pointer,
+                        key: Some(""),
+                        tag: Some("Hashratesplit Status"),
+                    },
+                ),
+            ],
             DataField::IsMining => vec![(
                 WEB_SUMMARY,
                 DataExtractor {
                     func: get_by_pointer,
                     key: Some("/Status/Operating State"),
+                    tag: None,
+                },
+            )],
+            DataField::OperatingState => vec![(
+                WEB_SUMMARY,
+                DataExtractor {
+                    func: get_by_pointer,
+                    key: Some("/Status/Operating State"),
+                    tag: None,
+                },
+            )],
+            DataField::DevFeeConnected => vec![(
+                WEB_SUMMARY,
+                DataExtractor {
+                    func: get_by_pointer,
+                    key: Some("/Last Devfee Error"),
                     tag: None,
                 },
             )],
@@ -375,14 +659,28 @@ impl GetDataLocations for PowerPlayV1 {
                     },
                 ),
             ],
-            DataField::SerialNumber => vec![(
-                WEB_CAPABILITIES,
-                DataExtractor {
-                    func: get_by_pointer,
-                    key: Some("/Control Board Version/cpuSerial"),
-                    tag: None,
-                },
-            )],
+            // Tagged rather than relying on location order: `Miner Serial
+            // Number` is frequently present-but-null, and `get_by_pointer`
+            // returns `Some(Value::Null)` for that, which an untagged fallback
+            // would merge over the control board serial and lose both.
+            DataField::SerialNumber => vec![
+                (
+                    WEB_CAPABILITIES,
+                    DataExtractor {
+                        func: get_by_pointer,
+                        key: Some("/Miner Serial Number"),
+                        tag: Some("miner"),
+                    },
+                ),
+                (
+                    WEB_CAPABILITIES,
+                    DataExtractor {
+                        func: get_by_pointer,
+                        key: Some("/Control Board Version/cpuSerial"),
+                        tag: Some("control_board"),
+                    },
+                ),
+            ],
             DataField::ExpectedHashrate => vec![(
                 WEB_CAPABILITIES,
                 DataExtractor {
@@ -456,7 +754,11 @@ impl GetMAC for PowerPlayV1 {
 
 impl GetSerialNumber for PowerPlayV1 {
     fn parse_serial_number(&self, data: &HashMap<DataField, Value>) -> Option<String> {
-        data.extract::<String>(DataField::SerialNumber)
+        // The manufacturer serial is the meaningful identifier, but PowerPlay
+        // only reports it on some units; fall back to the control board CPU
+        // serial so the field stays populated everywhere it used to be.
+        data.extract_nested::<String>(DataField::SerialNumber, "miner")
+            .or_else(|| data.extract_nested::<String>(DataField::SerialNumber, "control_board"))
     }
 }
 
@@ -615,9 +917,9 @@ impl GetHashboards for PowerPlayV1 {
                             HashRate {
                                 value: h,
                                 unit: HashRateUnit::MegaHash,
-                                algo: "SHA256".to_string(),
+                                algo: self.device_info.algo,
                             }
-                            .as_unit(HashRateUnit::default())
+                            .as_default_unit()
                         });
                     hashboard.voltage = board
                         .get("Input Voltage")
@@ -634,9 +936,9 @@ impl GetHashboards for PowerPlayV1 {
                             HashRate {
                                 value: chips as f64 * hashes_per_clock * frequency.as_megahertz(),
                                 unit: HashRateUnit::MegaHash,
-                                algo: "SHA256".to_string(),
+                                algo: self.device_info.algo,
                             }
-                            .as_unit(HashRateUnit::default())
+                            .as_default_unit()
                         });
                     hashboard.board_temperature = board
                         .get("Temperature")
@@ -766,9 +1068,9 @@ impl GetHashboards for PowerPlayV1 {
                                 HashRate {
                                     value: hr,
                                     unit: HashRateUnit::MegaHash,
-                                    algo: "SHA256".to_string(),
+                                    algo: self.device_info.algo,
                                 }
-                                .as_unit(HashRateUnit::default()),
+                                .as_default_unit(),
                             );
                         }
                     }
@@ -817,9 +1119,9 @@ impl GetHashrate for PowerPlayV1 {
             HashRate {
                 value: total_hashrate,
                 unit: HashRateUnit::MegaHash,
-                algo: "SHA256".to_string(),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default()),
+            .as_default_unit(),
         )
     }
 }
@@ -830,9 +1132,9 @@ impl GetExpectedHashrate for PowerPlayV1 {
             HashRate {
                 value: f,
                 unit: HashRateUnit::TeraHash,
-                algo: "SHA256".to_string(),
+                algo: self.device_info.algo,
             }
-            .as_unit(HashRateUnit::default())
+            .as_default_unit()
         })
     }
 }
@@ -864,6 +1166,7 @@ impl GetFans for PowerPlayV1 {
 }
 
 impl GetPsuFans for PowerPlayV1 {}
+impl GetPsus for PowerPlayV1 {}
 impl GetTuningCapabilities for PowerPlayV1 {}
 
 impl GetFluidTemperature for PowerPlayV1 {}
@@ -890,21 +1193,44 @@ fn first_perpetual_tune_algorithm(summary: &Value) -> Option<(&str, &Value)> {
         .map(|(algorithm, stats)| (algorithm.as_str(), stats))
 }
 
+fn parse_manual_tuning_target(summary: &Value) -> TuningTarget {
+    let voltage = summary
+        .pointer("/Power Supply Stats/Target Voltage")
+        .and_then(tuning_value_as_f64)
+        .map(Voltage::from_millivolts);
+    let boards = summary
+        .pointer("/HwConfig/Boards Target Clock")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|board| {
+            let id = u8::try_from(board.get("Index")?.as_u64()?).ok()?;
+            let frequency = board
+                .get("Data")
+                .and_then(tuning_value_as_f64)
+                .map(Frequency::from_megahertz);
+            Some((id, (frequency, voltage)))
+        })
+        .collect();
+
+    TuningTarget::Manual { boards }
+}
+
 fn parse_tuning_target_from_stats(
-    summary: &Value,
     algorithm: &str,
     stats: &Value,
     algorithm_drives_power: bool,
+    algo: HashAlgorithm,
 ) -> Option<TuningTarget> {
     let target = tuning_value_as_f64(stats.get("Target")?)?;
-    parse_tuning_target_value_from_stats(summary, algorithm, stats, target, algorithm_drives_power)
+    parse_tuning_target_value_from_stats(algorithm, stats, target, algorithm_drives_power, algo)
 }
 
 fn parse_scaled_tuning_target_from_stats(
-    summary: &Value,
     algorithm: &str,
     stats: &Value,
     algorithm_drives_power: bool,
+    algo: HashAlgorithm,
 ) -> Option<TuningTarget> {
     let throttle_target = stats.get("Throttle Target").and_then(tuning_value_as_f64);
     let error_throttle_target = stats
@@ -915,15 +1241,15 @@ fn parse_scaled_tuning_target_from_stats(
         .flatten()
         .min_by(f64::total_cmp)?;
 
-    parse_tuning_target_value_from_stats(summary, algorithm, stats, target, algorithm_drives_power)
+    parse_tuning_target_value_from_stats(algorithm, stats, target, algorithm_drives_power, algo)
 }
 
 fn parse_tuning_target_value_from_stats(
-    summary: &Value,
     algorithm: &str,
     stats: &Value,
     target: f64,
     algorithm_drives_power: bool,
+    algo: HashAlgorithm,
 ) -> Option<TuningTarget> {
     let unit = stats
         .get("Unit")
@@ -937,19 +1263,13 @@ fn parse_tuning_target_value_from_stats(
     }
 
     let hr_unit = unit.parse::<HashRateUnit>().ok()?;
-    let algo = summary
-        .pointer("/Mining/Algorithm")
-        .and_then(Value::as_str)
-        .unwrap_or("SHA256")
-        .to_string();
-
     Some(TuningTarget::HashRate(
         HashRate {
             value: target,
             unit: hr_unit,
             algo,
         }
-        .as_unit(HashRateUnit::default()),
+        .as_default_unit(),
     ))
 }
 
@@ -973,11 +1293,11 @@ impl GetTuningTarget for PowerPlayV1 {
                 .pointer("/PerpetualTune/Running")
                 .and_then(Value::as_bool)?
             {
-                return None;
+                return Some(parse_manual_tuning_target(summary));
             }
 
             let (algorithm, stats) = first_perpetual_tune_algorithm(summary)?;
-            parse_tuning_target_from_stats(summary, algorithm, stats, true)
+            parse_tuning_target_from_stats(algorithm, stats, true, self.device_info.algo)
         })
     }
 }
@@ -989,11 +1309,11 @@ impl GetScaledTuningTarget for PowerPlayV1 {
                 .pointer("/PerpetualTune/Running")
                 .and_then(Value::as_bool)?
             {
-                return None;
+                return Some(parse_manual_tuning_target(summary));
             }
 
             let (algorithm, stats) = first_perpetual_tune_algorithm(summary)?;
-            parse_scaled_tuning_target_from_stats(summary, algorithm, stats, true)
+            parse_scaled_tuning_target_from_stats(algorithm, stats, true, self.device_info.algo)
         })
     }
 }
@@ -1001,6 +1321,38 @@ impl GetScaledTuningTarget for PowerPlayV1 {
 impl GetLightFlashing for PowerPlayV1 {
     fn parse_light_flashing(&self, data: &HashMap<DataField, Value>) -> Option<bool> {
         data.extract::<bool>(DataField::LightFlashing)
+    }
+}
+
+fn format_last_error(last_error: &Value) -> Option<String> {
+    match last_error {
+        Value::Null => None,
+        Value::String(message) => {
+            let message = message.trim();
+            if message.is_empty() {
+                return None;
+            }
+
+            // Older PowerPlay versions may serialize the externally tagged
+            // MinerError object into a JSON string instead of returning the
+            // object directly.
+            serde_json::from_str::<Value>(message)
+                .ok()
+                .filter(|value| value.is_object())
+                .and_then(|value| format_last_error(&value))
+                .or_else(|| Some(message.to_string()))
+        }
+        Value::Object(error) if error.is_empty() => None,
+        Value::Object(error) if error.len() == 1 => {
+            let (kind, details) = error.iter().next()?;
+            match details {
+                Value::Null => Some(kind.clone()),
+                Value::String(message) if message.trim().is_empty() => Some(kind.clone()),
+                Value::String(message) => Some(message.trim().to_string()),
+                details => Some(format!("{kind}: {details}")),
+            }
+        }
+        value => Some(value.to_string()),
     }
 }
 
@@ -1012,13 +1364,12 @@ impl GetMessages for PowerPlayV1 {
         if let Some(last_error) = data
             .get(&DataField::Messages)
             .and_then(|v| v.pointer("/Status/Last Error"))
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
+            .and_then(format_last_error)
         {
             messages.push(MinerMessage::new(
                 timestamp as u32,
                 0,
-                last_error.to_string(),
+                last_error,
                 MessageSeverity::Error,
             ));
         }
@@ -1033,6 +1384,23 @@ impl GetUptime for PowerPlayV1 {
     }
 }
 
+impl GetBestShare for PowerPlayV1 {}
+impl GetSessionBestShare for PowerPlayV1 {}
+
+impl GetOperatingState for PowerPlayV1 {
+    fn parse_operating_state(&self, data: &HashMap<DataField, Value>) -> Option<OperatingState> {
+        data.get(&DataField::OperatingState)
+            .and_then(Value::as_str)
+            .and_then(OperatingState::from_label)
+    }
+}
+
+impl GetDevFeeConnected for PowerPlayV1 {
+    fn parse_devfee_connected(&self, data: &HashMap<DataField, Value>) -> Option<bool> {
+        data.get(&DataField::DevFeeConnected).map(Value::is_null)
+    }
+}
+
 impl GetIsMining for PowerPlayV1 {
     fn parse_is_mining(&self, data: &HashMap<DataField, Value>) -> bool {
         data.extract::<String>(DataField::IsMining)
@@ -1043,82 +1411,25 @@ impl GetIsMining for PowerPlayV1 {
 
 impl GetPools for PowerPlayV1 {
     fn parse_pools(&self, data: &HashMap<DataField, Value>) -> Vec<PoolGroupData> {
-        let mut pools_vec: Vec<PoolData> = Vec::new();
+        let Some(pools_data) = data.get(&DataField::Pools) else {
+            return vec![];
+        };
 
-        if let Some(configs) = data
-            .get(&DataField::Pools)
-            .and_then(|v| v.pointer("/StratumConfigs"))
-            .and_then(|v| v.as_array())
-        {
-            for (idx, config) in configs.iter().enumerate() {
-                let url = config.get("pool").and_then(|v| v.as_str()).and_then(|s| {
-                    if s.is_empty() {
-                        None
-                    } else {
-                        Some(PoolURL::from(s.to_string()))
-                    }
-                });
-                let user = config
-                    .get("login")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                pools_vec.push(PoolData {
-                    position: Some(idx as u16),
-                    url,
-                    accepted_shares: None,
-                    rejected_shares: None,
-                    active: Some(false),
-                    alive: None,
-                    user,
-                });
-            }
+        let Some(pools_object) = pools_data.as_object() else {
+            return vec![];
+        };
+
+        let split_enabled = pools_object
+            .get("Hashratesplit Config")
+            .and_then(|v| v.get("enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        if split_enabled {
+            Self::parse_hashrate_split_pools(pools_object)
+        } else {
+            Self::parse_standard_pools(pools_object)
         }
-
-        if let Some(stratum) = data
-            .get(&DataField::Pools)
-            .and_then(|v| v.pointer("/Stratum"))
-            .and_then(|v| v.as_object())
-        {
-            for pool in pools_vec.iter_mut() {
-                if pool.position
-                    == stratum
-                        .get("Config Id")
-                        .and_then(|v| v.as_u64().map(|v| v as u16))
-                {
-                    pool.active = Some(true);
-                    pool.alive = stratum.get("IsPoolConnected").and_then(|v| v.as_bool());
-                    pool.user = stratum
-                        .get("Current User")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-                    pool.url = stratum
-                        .get("Current Pool")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| {
-                            if s.is_empty() {
-                                None
-                            } else {
-                                Some(PoolURL::from(s.to_string()))
-                            }
-                        });
-
-                    // Get Stats
-                    if let Some(session) = data
-                        .get(&DataField::Pools)
-                        .and_then(|v| v.pointer("/Session"))
-                        .and_then(|v| v.as_object())
-                    {
-                        pool.accepted_shares = session.get("Accepted").and_then(|v| v.as_u64());
-                        pool.rejected_shares = session.get("Rejected").and_then(|v| v.as_u64());
-                    }
-                }
-            }
-        }
-        vec![PoolGroupData {
-            name: String::new(),
-            quota: 1,
-            pools: pools_vec,
-        }]
     }
 }
 
@@ -1167,7 +1478,7 @@ impl SupportsPoolsConfig for PowerPlayV1 {
         };
 
         let split_enabled = pools_object
-            .get("hashratesplit")
+            .get("Hashratesplit Config")
             .and_then(|v| v.get("enabled"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
@@ -1176,7 +1487,7 @@ impl SupportsPoolsConfig for PowerPlayV1 {
             let mut groups: Vec<PoolGroupConfig> = Vec::new();
 
             if let Some(splits) = pools_object
-                .get("hashratesplit")
+                .get("Hashratesplit Config")
                 .and_then(|v| v.get("hashrate_splits"))
                 .and_then(Value::as_array)
             {
@@ -1222,7 +1533,11 @@ impl SupportsPoolsConfig for PowerPlayV1 {
             .collect();
 
         anyhow::ensure!(!groups.is_empty(), "No non-empty pool groups provided");
-        anyhow::ensure!(groups.len() <= 3, "ePIC supports up to 3 pool groups");
+        anyhow::ensure!(
+            groups.len() <= 3,
+            "{} supports up to 3 pool groups",
+            EPicFirmware::default()
+        );
 
         let coin = Self::coin_type_for_hash_algorithm(self.device_info.algo);
         let unique_id_enabled = false;
@@ -1323,7 +1638,38 @@ impl SupportsPoolsConfig for PowerPlayV1 {
     }
 }
 
+#[async_trait]
 impl SupportsScalingConfig for PowerPlayV1 {
+    async fn set_scaling_config(&self, config: ScalingConfig) -> anyhow::Result<bool> {
+        // PowerPlay has no scaling-only endpoint: `min_throttle` and
+        // `throttle_step` are written by the same `perpetualtune/algo` call that
+        // sets the tuning target, so the current target is read and resent to
+        // avoid clobbering it.
+        let current = self.get_tuning_config().await?;
+        self.set_tuning_config(current, Some(config)).await
+    }
+
+    async fn reset_scaling(&self) -> anyhow::Result<bool> {
+        let tuning = self.get_tuning_config().await?;
+        let algorithm = tuning.algorithm().ok_or_else(|| {
+            anyhow::anyhow!("Cannot reset scaling when perpetual tuning is not running")
+        })?;
+
+        self.web
+            .send_command(
+                "perpetualtune/reset",
+                false,
+                Some(json!({ "param": algorithm })),
+                Method::POST,
+            )
+            .await
+            .map(|v| v.get("result").and_then(Value::as_bool).unwrap_or(false))
+    }
+
+    fn supports_reset_scaling(&self) -> bool {
+        true
+    }
+
     fn parse_scaling_config(
         &self,
         data: &HashMap<ConfigField, Value>,
@@ -1372,12 +1718,19 @@ impl SupportsTuningConfig for PowerPlayV1 {
                 "power" | "powertune" => Ok("PowerTune"),
                 "boardtune" => Ok("BoardTune"),
                 _ => anyhow::bail!(
-                    "Unsupported perpetual tune algorithm '{algorithm_input}' for ePIC PowerPlay"
+                    "Unsupported perpetual tune algorithm '{algorithm_input}' for {}",
+                    EPicFirmware::default()
                 ),
             }
         };
 
         let (algorithm, target) = match &config.target {
+            TuningTarget::Manual { .. } => {
+                anyhow::bail!(
+                    "Manual tuning target is not supported for {} config",
+                    EPicFirmware::default()
+                )
+            }
             TuningTarget::Power(power) => (
                 "PowerTune",
                 to_non_negative_u32_target(power.as_watts(), "power")?,
@@ -1398,12 +1751,21 @@ impl SupportsTuningConfig for PowerPlayV1 {
                 (algorithm, target)
             }
             TuningTarget::MiningMode(_) => {
-                anyhow::bail!("MiningMode tuning target is not supported on ePIC PowerPlay")
+                anyhow::bail!(
+                    "MiningMode tuning target is not supported on {}",
+                    EPicFirmware::default()
+                )
+            }
+            TuningTarget::Preset(_) => {
+                anyhow::bail!(
+                    "Preset tuning target is not supported on {}",
+                    EPicFirmware::default()
+                )
             }
         };
 
         let Some(scaling) = scaling_config else {
-            anyhow::bail!("ScalingConfig is required for ePIC PowerPlay")
+            anyhow::bail!("ScalingConfig is required for {}", EPicFirmware::default())
         };
 
         let payload = json!({
@@ -1427,9 +1789,16 @@ impl SupportsTuningConfig for PowerPlayV1 {
     ) -> anyhow::Result<TuningConfig> {
         data.get(&ConfigField::Tuning)
             .and_then(|summary| {
+                if !summary
+                    .pointer("/PerpetualTune/Running")
+                    .and_then(Value::as_bool)?
+                {
+                    return Some(TuningConfig::new(parse_manual_tuning_target(summary)));
+                }
+
                 let (algorithm, stats) = first_perpetual_tune_algorithm(summary)?;
                 let tuning_target =
-                    parse_tuning_target_from_stats(summary, algorithm, stats, false)?;
+                    parse_tuning_target_from_stats(algorithm, stats, false, self.device_info.algo)?;
                 Some(TuningConfig::new(tuning_target).with_algorithm(algorithm))
             })
             .ok_or_else(|| {
@@ -1495,6 +1864,46 @@ impl SupportsFanConfig for PowerPlayV1 {
     }
 
     fn supports_fan_config(&self) -> bool {
+        true
+    }
+}
+
+#[async_trait]
+impl SupportsTimezoneConfig for PowerPlayV1 {
+    fn parse_timezone_config(
+        &self,
+        data: &HashMap<ConfigField, Value>,
+    ) -> anyhow::Result<TimezoneConfig> {
+        let timezone_name = data
+            .get(&ConfigField::Timezone)
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("No timezone data returned"))?;
+        let timezone = Tz::from_str(timezone_name)
+            .map_err(|_| anyhow::anyhow!("Unknown IANA timezone {timezone_name:?}"))?;
+
+        Ok(TimezoneConfig {
+            timezone: Some(timezone),
+            available: vec![],
+        })
+    }
+
+    async fn set_timezone_config(&self, config: TimezoneConfig) -> anyhow::Result<bool> {
+        let timezone = config
+            .timezone
+            .ok_or_else(|| anyhow::anyhow!("Timezone config has no timezone to set"))?;
+
+        self.web
+            .send_command(
+                "timezone",
+                false,
+                Some(json!({ "param": timezone.name() })),
+                Method::POST,
+            )
+            .await
+            .map(|v| v.get("result").and_then(Value::as_bool).unwrap_or(false))
+    }
+
+    fn supports_timezone_config(&self) -> bool {
         true
     }
 }
@@ -1579,7 +1988,61 @@ impl FactoryReset for PowerPlayV1 {
 }
 
 #[async_trait]
+impl RestartMining for PowerPlayV1 {
+    async fn restart_mining(&self) -> anyhow::Result<bool> {
+        self.web.soft_reboot().await?;
+        Ok(true)
+    }
+
+    fn supports_restart_mining(&self) -> bool {
+        true
+    }
+}
+
+#[async_trait]
+impl RestoreStockOs for PowerPlayV1 {
+    async fn restore_stock_os(&self) -> anyhow::Result<RestoreStockOsResult> {
+        if !self.restore_stock_os_support().await? {
+            anyhow::bail!("Restoring the stock OS is not supported by this UMC OS build");
+        }
+
+        self.web.uninstall().await?;
+        Ok(RestoreStockOsResult::accepted(None))
+    }
+
+    fn supports_restore_stock_os(&self) -> bool {
+        self.restore_stock_os_supported
+            .get()
+            .copied()
+            // An empty cell means the capabilities probe failed transiently, not
+            // that this build is known to lack the endpoint. Keep the action
+            // available so restore_stock_os() can retry the probe.
+            .unwrap_or(true)
+    }
+}
+
+#[async_trait]
 impl UpgradeFirmware for PowerPlayV1 {
+    fn supports_check_firmware_update(&self) -> bool {
+        true
+    }
+
+    async fn check_firmware_update(&self) -> anyhow::Result<FirmwareStats> {
+        let data = self
+            .get_collector()
+            .collect(&[DataField::ControlBoardVersion, DataField::FirmwareVersion])
+            .await;
+        let platform = data.extract_nested::<String>(DataField::ControlBoardVersion, "platform");
+        let cpu = data.extract_nested::<String>(DataField::ControlBoardVersion, "cpu");
+        let repository =
+            releases::repository(platform.as_deref(), cpu.as_deref(), &self.device_info.make)?;
+        let current_version = self
+            .parse_firmware_version(&data)
+            .as_deref()
+            .and_then(releases::parse_version);
+        releases::check(repository, current_version).await
+    }
+
     async fn upgrade_firmware(&self, image: FirmwareImage) -> anyhow::Result<bool> {
         self.web.upgrade_firmware(image).await
     }
@@ -1609,22 +2072,447 @@ impl SupportsTemperatureConfig for PowerPlayV1 {}
 impl GetTuningPercent for PowerPlayV1 {}
 impl SetTuningPercent for PowerPlayV1 {}
 
+impl SupportsPresets for PowerPlayV1 {}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use anyhow::{self, Context};
     use asic_rs_core::{
+        data::operating_state::OperatingState,
         test::{api::MockAPIClient, util::get_miner},
         traits::firmware::MinerFirmware,
     };
     use asic_rs_makes_antminer::models::AntMinerModel;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
 
     use super::*;
     use crate::test::json::v1::{
         CAPABILITIES, CHIP_CLOCKS, CHIP_HASHRATES, CHIP_TEMPS, CHIP_VOLTAGES, NETWORK, SUMMARY,
         TEMPS,
     };
+
+    struct SummaryClient {
+        summary: Value,
+        calls: AtomicUsize,
+    }
+
+    struct MockJsonServer {
+        port: u16,
+        task: tokio::task::JoinHandle<anyhow::Result<String>>,
+    }
+
+    struct MockJsonSequenceServer {
+        port: u16,
+        task: tokio::task::JoinHandle<anyhow::Result<Vec<String>>>,
+    }
+
+    async fn read_http_request(socket: &mut TcpStream) -> anyhow::Result<String> {
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+
+        loop {
+            if let Some(header_end) = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|position| position + 4)
+            {
+                let headers = std::str::from_utf8(&request[..header_end])?;
+                let content_length = headers
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find_map(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or_default();
+                if request.len() >= header_end + content_length {
+                    break;
+                }
+            }
+
+            let bytes_read = socket.read(&mut chunk).await?;
+            if bytes_read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..bytes_read]);
+        }
+
+        Ok(String::from_utf8(request)?)
+    }
+
+    async fn mock_json_server(response: Value) -> anyhow::Result<MockJsonServer> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .context("timed out waiting for HTTP request")??;
+            let request = read_http_request(&mut socket).await?;
+            let body = response.to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await?;
+            Ok(request)
+        });
+
+        Ok(MockJsonServer { port, task })
+    }
+
+    async fn mock_json_sequence_server(
+        responses: Vec<(&'static str, Value)>,
+    ) -> anyhow::Result<MockJsonSequenceServer> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::with_capacity(responses.len());
+            for (status, body) in responses {
+                let (mut socket, _) =
+                    tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                        .await
+                        .context("timed out waiting for HTTP request")??;
+                requests.push(read_http_request(&mut socket).await?);
+
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await?;
+            }
+            Ok(requests)
+        });
+
+        Ok(MockJsonSequenceServer { port, task })
+    }
+
+    fn json_request_body(request: &str) -> anyhow::Result<Value> {
+        let (_, body) = request
+            .split_once("\r\n\r\n")
+            .context("HTTP request did not contain a body separator")?;
+        Ok(serde_json::from_str(body)?)
+    }
+
+    #[async_trait]
+    impl APIClient for SummaryClient {
+        async fn get_api_result(&self, command: &MinerCommand) -> anyhow::Result<Value> {
+            assert_eq!(
+                command,
+                &MinerCommand::WebAPI {
+                    command: "summary",
+                    parameters: None
+                }
+            );
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.summary.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_stock_os_support_is_discovered_from_capabilities() -> anyhow::Result<()> {
+        let cases = [
+            (json!({ "UninstallSupported": true }), true),
+            (json!({ "UninstallSupported": false }), false),
+            (json!({}), false),
+        ];
+
+        for (capabilities, expected) in cases {
+            let MockJsonServer { port, task } = mock_json_server(capabilities).await?;
+            let miner = PowerPlayV1::new_with_port(
+                IpAddr::from([127, 0, 0, 1]),
+                AntMinerModel::S19XP,
+                port,
+            );
+
+            assert_eq!(miner.restore_stock_os_support().await?, expected);
+
+            let request = task.await??;
+            assert!(request.starts_with("GET /capabilities HTTP/1.1\r\n"));
+            assert_eq!(miner.supports_restore_stock_os(), expected);
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restore_stock_os_posts_authenticated_null_parameter() -> anyhow::Result<()> {
+        let MockJsonServer { port, task } =
+            mock_json_server(json!({ "result": true, "error": null })).await?;
+        let mut miner =
+            PowerPlayV1::new_with_port(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S19XP, port);
+        miner.restore_stock_os_supported.set(true)?;
+        miner.set_auth(MinerAuth::new("", "test-password"));
+
+        assert!(!miner.supports_factory_reset());
+        assert_eq!(
+            miner.restore_stock_os().await?,
+            RestoreStockOsResult::accepted(None)
+        );
+
+        let request = task.await??;
+        assert!(request.starts_with("POST /uninstall HTTP/1.1\r\n"));
+        assert_eq!(
+            json_request_body(&request)?,
+            json!({ "param": null, "password": "test-password" })
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restore_stock_os_surfaces_uninstall_errors() -> anyhow::Result<()> {
+        for error_message in [
+            "uninstall script not found: /usr/html/data/uninstall.sh",
+            "uninstalling failed with error: exit status: 1",
+        ] {
+            let MockJsonServer { port, task } = mock_json_server(json!({
+                "result": false,
+                "error": { "UninstallError": error_message }
+            }))
+            .await?;
+            let miner = PowerPlayV1::new_with_port(
+                IpAddr::from([127, 0, 0, 1]),
+                AntMinerModel::S19XP,
+                port,
+            );
+            miner.restore_stock_os_supported.set(true)?;
+
+            let error = miner.restore_stock_os().await.unwrap_err();
+
+            let request = task.await??;
+            assert!(request.starts_with("POST /uninstall HTTP/1.1\r\n"));
+            assert!(error.to_string().contains(error_message));
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_mining_posts_authenticated_soft_reboot() -> anyhow::Result<()> {
+        let MockJsonServer { port, task } =
+            mock_json_server(json!({ "result": true, "error": null })).await?;
+        let mut miner =
+            PowerPlayV1::new_with_port(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S19XP, port);
+        miner.set_auth(MinerAuth::new("", "test-password"));
+
+        assert!(miner.supports_restart_mining());
+        assert!(miner.restart_mining().await?);
+
+        let request = task.await??;
+        assert!(request.starts_with("POST /softreboot HTTP/1.1\r\n"));
+        assert_eq!(
+            json_request_body(&request)?,
+            json!({ "param": null, "password": "test-password" })
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_mining_surfaces_soft_reboot_errors() -> anyhow::Result<()> {
+        let MockJsonServer { port, task } =
+            mock_json_server(json!({ "result": false, "error": "Wrong password" })).await?;
+        let miner =
+            PowerPlayV1::new_with_port(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S19XP, port);
+
+        let error = miner.restart_mining().await.unwrap_err();
+
+        let request = task.await??;
+        assert!(request.starts_with("POST /softreboot HTTP/1.1\r\n"));
+        assert!(error.to_string().contains("Wrong password"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restore_stock_os_refuses_unadvertised_endpoint() {
+        let miner =
+            PowerPlayV1::new_with_port(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S19XP, 1);
+        miner.restore_stock_os_supported.set(false).unwrap();
+
+        assert!(!miner.supports_restore_stock_os());
+        let error = miner.restore_stock_os().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("not supported by this UMC OS build")
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_stock_os_retries_support_probe_after_transient_error() -> anyhow::Result<()> {
+        let MockJsonSequenceServer { port, task } = mock_json_sequence_server(vec![
+            ("503 Service Unavailable", json!({ "error": "temporary" })),
+            ("200 OK", json!({ "UninstallSupported": true })),
+            ("200 OK", json!({ "result": true, "error": null })),
+        ])
+        .await?;
+        let miner =
+            PowerPlayV1::new_with_port(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S19XP, port);
+
+        assert!(miner.restore_stock_os_support().await.is_err());
+        assert!(miner.supports_restore_stock_os());
+        assert_eq!(
+            miner.restore_stock_os().await?,
+            RestoreStockOsResult::accepted(None)
+        );
+        assert!(miner.supports_restore_stock_os());
+
+        let requests = task.await??;
+        assert!(requests[0].starts_with("GET /capabilities HTTP/1.1\r\n"));
+        assert!(requests[1].starts_with("GET /capabilities HTTP/1.1\r\n"));
+        assert!(requests[2].starts_with("POST /uninstall HTTP/1.1\r\n"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn operating_state_reuses_summary_and_preserves_reported_labels() -> anyhow::Result<()> {
+        let miner = PowerPlayV1::new(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S19XP);
+        let cases = [
+            ("Mining", OperatingState::Mining {}, true),
+            ("Idling", OperatingState::Idling {}, false),
+            ("Initializing", OperatingState::Initializing {}, true),
+            (
+                "AdjustingClockVoltage",
+                OperatingState::AdjustingClockVoltage {},
+                true,
+            ),
+            ("Error", OperatingState::Error {}, true),
+            (
+                "FutureUmcState",
+                OperatingState::Unknown {
+                    raw: "FutureUmcState".into(),
+                },
+                true,
+            ),
+        ];
+        for (label, expected, is_mining) in cases {
+            let mut summary = Value::from_str(SUMMARY)?;
+            summary["Status"]["Operating State"] = json!(label);
+            let client = SummaryClient {
+                summary,
+                calls: AtomicUsize::new(0),
+            };
+            let mut collector = DataCollector::new_with_client(&miner, &client);
+            let data = collector
+                .collect(&[
+                    DataField::OperatingState,
+                    DataField::IsMining,
+                    DataField::TuningTarget,
+                ])
+                .await;
+            let snapshot = miner.parse_data(data);
+            assert_eq!(snapshot.operating_state, Some(expected.clone()));
+            assert_eq!(snapshot.is_mining, is_mining);
+            assert_eq!(client.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                serde_json::to_value(&snapshot)?["operating_state"],
+                serde_json::to_value(&expected)?,
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn devfee_connection_uses_summary_field_presence_and_error() -> anyhow::Result<()> {
+        let miner = PowerPlayV1::new(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S19XP);
+        let cases = [
+            (None, None),
+            (Some(Value::Null), Some(true)),
+            (
+                Some(json!({
+                    "DevfeeError": "devfee not connected, withholding submission shares"
+                })),
+                Some(false),
+            ),
+        ];
+
+        for (field, expected_connected) in cases {
+            let mut summary = Value::from_str(SUMMARY)?;
+            let summary_object = summary
+                .as_object_mut()
+                .context("summary fixture is an object")?;
+            summary_object.remove("Last Devfee Error");
+            if let Some(field) = field {
+                summary_object.insert("Last Devfee Error".into(), field);
+            }
+
+            let client = SummaryClient {
+                summary,
+                calls: AtomicUsize::new(0),
+            };
+            let mut collector = DataCollector::new_with_client(&miner, &client);
+            let data = collector.collect(&[DataField::DevFeeConnected]).await;
+            let snapshot = miner.parse_data(data);
+
+            assert_eq!(snapshot.devfee_connected, expected_connected);
+            assert_eq!(client.calls.load(Ordering::SeqCst), 1);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unavailable_or_excluded_operating_state_is_not_invented() -> anyhow::Result<()> {
+        let miner = PowerPlayV1::new(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S19XP);
+        for status in [
+            json!({}),
+            json!({ "Operating State": null }),
+            json!({ "Operating State": true }),
+            json!({ "Operating State": 7 }),
+            json!({ "Operating State": [] }),
+            json!({ "Operating State": {} }),
+            json!({ "Operating State": "" }),
+        ] {
+            let mut summary = Value::from_str(SUMMARY)?;
+            summary["Status"] = status;
+            let client = SummaryClient {
+                summary,
+                calls: AtomicUsize::new(0),
+            };
+            let mut collector = DataCollector::new_with_client(&miner, &client);
+            let data = collector
+                .collect(&[DataField::OperatingState, DataField::IsMining])
+                .await;
+            let snapshot = miner.parse_data(data);
+            assert_eq!(snapshot.operating_state, None);
+            assert!(snapshot.is_mining); // Preserve the legacy fallback, independently.
+        }
+
+        let client = SummaryClient {
+            summary: Value::from_str(SUMMARY)?,
+            calls: AtomicUsize::new(0),
+        };
+        let mut collector = DataCollector::new_with_client(&miner, &client);
+        let data = collector.collect(&[DataField::IsMining]).await;
+        assert_eq!(miner.parse_data(data).operating_state, None);
+
+        let mut legacy = serde_json::to_value(miner.parse_data(HashMap::new()))?;
+        legacy
+            .as_object_mut()
+            .context("snapshot serializes to an object")?
+            .remove("operating_state");
+        legacy
+            .as_object_mut()
+            .context("snapshot serializes to an object")?
+            .remove("devfee_connected");
+        let restored: asic_rs_core::data::miner::MinerData = serde_json::from_value(legacy)?;
+        assert_eq!(restored.operating_state, None);
+        assert_eq!(restored.devfee_connected, None);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn parse_data_test_antminer_s19xp() -> anyhow::Result<()> {
@@ -1722,11 +2610,15 @@ mod tests {
         assert_eq!(miner_data.hashboards[0].active, Some(false));
         assert_eq!(miner_data.hashboards[1].chips.len(), 110);
         assert_eq!(
+            miner_data.pools[0].pools[0].last_share_time,
+            Some(1_755_134_734)
+        );
+        assert_eq!(
             miner_data.hashboards[1].chips[69].hashrate,
             Some(HashRate {
                 value: 305937.8,
                 unit: HashRateUnit::MegaHash,
-                algo: "SHA256".to_string(),
+                algo: HashAlgorithm::SHA256,
             })
         );
         assert_eq!(
@@ -1734,7 +2626,7 @@ mod tests {
             Some(HashRate {
                 value: 487695.28,
                 unit: HashRateUnit::MegaHash,
-                algo: "SHA256".to_string(),
+                algo: HashAlgorithm::SHA256,
             })
         );
 
@@ -1759,15 +2651,67 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn reset_scaling_uses_active_algorithm() -> anyhow::Result<()> {
+        let mut summary = Value::from_str(SUMMARY)?;
+        let algorithm = summary
+            .pointer_mut("/PerpetualTune/Algorithm")
+            .context("missing perpetual tune algorithm")?;
+        let stats = algorithm
+            .as_object_mut()
+            .context("perpetual tune algorithm is not an object")?
+            .remove("VoltageOptimizer")
+            .context("missing VoltageOptimizer stats")?;
+        algorithm
+            .as_object_mut()
+            .context("perpetual tune algorithm is not an object")?
+            .insert("BoardTune".to_string(), stats);
+
+        let MockJsonSequenceServer { port, task } = mock_json_sequence_server(vec![
+            ("200 OK", summary),
+            ("200 OK", json!({ "result": true })),
+        ])
+        .await?;
+        let miner =
+            PowerPlayV1::new_with_port(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S19XP, port);
+
+        assert!(miner.supports_reset_scaling());
+        assert!(miner.reset_scaling().await?);
+
+        let requests = task.await??;
+        assert!(requests[0].starts_with("GET /summary HTTP/1.1\r\n"));
+        assert!(requests[1].starts_with("POST /perpetualtune/reset HTTP/1.1\r\n"));
+        let body = json_request_body(&requests[1])?;
+        assert_eq!(body.get("param").and_then(Value::as_str), Some("BoardTune"));
+        assert!(body.get("password").and_then(Value::as_str).is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reset_scaling_requires_running_perpetual_tune() -> anyhow::Result<()> {
+        let mut summary = Value::from_str(SUMMARY)?;
+        summary["PerpetualTune"]["Running"] = json!(false);
+        let MockJsonServer { port, task } = mock_json_server(summary).await?;
+        let miner =
+            PowerPlayV1::new_with_port(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S19XP, port);
+
+        let error = miner.reset_scaling().await.unwrap_err();
+        assert!(error.to_string().contains("not running"));
+        let request = task.await??;
+        assert!(request.starts_with("GET /summary HTTP/1.1\r\n"));
+
+        Ok(())
+    }
+
     #[test]
     fn parse_messages_uses_summary_status_last_error() {
         let miner = PowerPlayV1::new(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S19XP);
         let summary = serde_json::json!({
             "Status": {
-                "Operating State": "AdjustingClockVoltage",
-                "Last Command": "autostart",
-                "Last Command Result": null,
-                "Last Error": "Clock voltage adjustment failed"
+                "Last Error": {
+                    "NoHashboardsEnabled": "no hashboards enabled"
+                }
             }
         });
         let data = HashMap::from([(DataField::Messages, summary)]);
@@ -1775,8 +2719,164 @@ mod tests {
         let messages = miner.parse_messages(&data);
 
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].message, "Clock voltage adjustment failed");
+        assert_eq!(messages[0].message, "no hashboards enabled");
         assert_eq!(messages[0].severity, MessageSeverity::Error);
+    }
+
+    #[test]
+    fn parse_messages_supports_legacy_string_errors_and_ignores_empty_errors() {
+        let miner = PowerPlayV1::new(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S19XP);
+
+        for (last_error, expected) in [
+            (
+                json!("Clock voltage adjustment failed"),
+                Some("Clock voltage adjustment failed"),
+            ),
+            (
+                json!(r#"{"NoHashboardsEnabled":"no hashboards enabled"}"#),
+                Some("no hashboards enabled"),
+            ),
+            (Value::Null, None),
+            (json!(""), None),
+        ] {
+            let data = HashMap::from([(
+                DataField::Messages,
+                json!({ "Status": { "Last Error": last_error } }),
+            )]);
+            let messages = miner.parse_messages(&data);
+
+            assert_eq!(
+                messages.first().map(|message| message.message.as_str()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn parse_tuning_target_returns_manual_when_perpetual_tune_is_disabled() -> anyhow::Result<()> {
+        let miner = PowerPlayV1::new(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S19XP);
+        let summary = serde_json::json!({
+            "PerpetualTune": { "Running": false },
+            "Power Supply Stats": { "Target Voltage": 12_600 },
+            "HwConfig": {
+                "Boards Target Clock": [
+                    { "Index": 0, "Data": 480 },
+                    { "Index": 1, "Data": 490 },
+                ]
+            }
+        });
+        let data = HashMap::from([(DataField::TuningTarget, summary.clone())]);
+        let expected = TuningTarget::Manual {
+            boards: HashMap::from([
+                (
+                    0,
+                    (
+                        Some(Frequency::from_megahertz(480.0)),
+                        Some(Voltage::from_volts(12.6)),
+                    ),
+                ),
+                (
+                    1,
+                    (
+                        Some(Frequency::from_megahertz(490.0)),
+                        Some(Voltage::from_volts(12.6)),
+                    ),
+                ),
+            ]),
+        };
+
+        assert_eq!(miner.parse_tuning_target(&data), Some(expected.clone()));
+        assert_eq!(
+            miner.parse_scaled_tuning_target(&data),
+            Some(expected.clone())
+        );
+
+        let config_data = HashMap::from([(ConfigField::Tuning, summary)]);
+        let config = miner.parse_tuning_config(&config_data)?;
+        assert_eq!(config.target, expected);
+        assert_eq!(config.algorithm, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn parse_tuning_target_preserves_enabled_tune_while_optimization_is_incomplete()
+    -> anyhow::Result<()> {
+        let miner = PowerPlayV1::new(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S19XP);
+        let summary = Value::from_str(SUMMARY)?;
+        let data = HashMap::from([(DataField::TuningTarget, summary)]);
+
+        assert_eq!(
+            miner.parse_tuning_target(&data),
+            Some(TuningTarget::HashRate(HashRate {
+                value: 143.0,
+                unit: HashRateUnit::TeraHash,
+                algo: HashAlgorithm::SHA256,
+            }))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn parse_tuning_target_requires_an_explicit_valid_running_flag() {
+        let miner = PowerPlayV1::new(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S19XP);
+        let invalid_summaries = [
+            serde_json::json!({}),
+            serde_json::json!({ "PerpetualTune": { "Running": null } }),
+            serde_json::json!({ "PerpetualTune": { "Running": "false" } }),
+        ];
+
+        for summary in invalid_summaries {
+            let data = HashMap::from([(DataField::TuningTarget, summary)]);
+            assert_eq!(miner.parse_tuning_target(&data), None);
+            assert_eq!(miner.parse_scaled_tuning_target(&data), None);
+        }
+
+        assert_eq!(miner.parse_tuning_target(&HashMap::new()), None);
+
+        let summary = serde_json::json!({ "PerpetualTune": { "Running": false } });
+        let data = HashMap::from([(DataField::TuningTarget, summary)]);
+        let expected = Some(TuningTarget::Manual {
+            boards: HashMap::new(),
+        });
+
+        assert_eq!(miner.parse_tuning_target(&data), expected);
+        assert_eq!(miner.parse_scaled_tuning_target(&data), expected);
+    }
+
+    #[test]
+    fn parse_manual_tuning_target_retains_each_available_setpoint_independently() {
+        let miner = PowerPlayV1::new(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S19XP);
+        let voltage_only = serde_json::json!({
+            "PerpetualTune": { "Running": false },
+            "Power Supply Stats": { "Target Voltage": 12_600 },
+        });
+        let frequency_only = serde_json::json!({
+            "PerpetualTune": { "Running": false },
+            "HwConfig": {
+                "Boards Target Clock": [
+                    { "Index": 0, "Data": 480 },
+                    { "Index": 1, "Data": 490 },
+                ]
+            }
+        });
+
+        assert_eq!(
+            miner.parse_tuning_target(&HashMap::from([(DataField::TuningTarget, voltage_only,)])),
+            Some(TuningTarget::Manual {
+                boards: HashMap::new(),
+            })
+        );
+        assert_eq!(
+            miner.parse_tuning_target(&HashMap::from([(DataField::TuningTarget, frequency_only,)])),
+            Some(TuningTarget::Manual {
+                boards: HashMap::from([
+                    (0, (Some(Frequency::from_megahertz(480.0)), None)),
+                    (1, (Some(Frequency::from_megahertz(490.0)), None)),
+                ]),
+            })
+        );
     }
 
     #[test]
@@ -1805,7 +2905,7 @@ mod tests {
             Some(TuningTarget::HashRate(HashRate {
                 value: 95.0,
                 unit: HashRateUnit::TeraHash,
-                algo: "SHA-256".to_string(),
+                algo: HashAlgorithm::SHA256,
             }))
         );
     }
@@ -1858,6 +2958,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parse_timezone_config_from_timezone_endpoint() -> anyhow::Result<()> {
+        let miner = PowerPlayV1::new(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S19XP);
+        let command = MinerCommand::WebAPI {
+            command: "timezone",
+            parameters: None,
+        };
+        let mock_api = MockAPIClient::new(HashMap::from([(command, json!("America/Toronto"))]));
+        let mut collector = ConfigCollector::new_with_client(&miner, &mock_api);
+
+        let data = collector.collect(&[ConfigField::Timezone]).await;
+        let config = miner.parse_timezone_config(&data)?;
+
+        assert_eq!(config.timezone, Some(Tz::America__Toronto));
+        assert!(config.available.is_empty());
+        assert!(miner.supports_timezone_config());
+
+        Ok(())
+    }
+
+    #[test]
+    fn parse_timezone_config_rejects_unknown_timezone() -> anyhow::Result<()> {
+        let miner = PowerPlayV1::new(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S19XP);
+        let data = HashMap::from([(ConfigField::Timezone, json!("not/a-timezone"))]);
+
+        let Err(error) = miner.parse_timezone_config(&data) else {
+            anyhow::bail!("unknown timezone should fail");
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "Unknown IANA timezone \"not/a-timezone\""
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     #[ignore = "requires live miner; set MINER_IP"]
     async fn parse_data_live_test_auto_detect() -> anyhow::Result<()> {
         let ip_str = std::env::var("MINER_IP").context("MINER_IP is not set")?;
@@ -1867,6 +3004,12 @@ mod tests {
         let miner = get_miner(ip, Arc::new(EPicFirmware::default()))
             .await?
             .context("no miner detected at MINER_IP")?;
+
+        println!(
+            "supports_restore_stock_os {}",
+            miner.supports_restore_stock_os()
+        );
+
         let miner_data = miner.get_data().await;
         let mut miner_data_print = miner_data.clone();
         for hashboard in &mut miner_data_print.hashboards {
@@ -1892,13 +3035,6 @@ mod tests {
         );
 
         println!(
-            "set_tuning_config {}",
-            miner
-                .set_tuning_config(tuning_config, Some(scaling_config))
-                .await?
-        );
-
-        println!(
             "fanconfig {}",
             serde_json::to_string_pretty(&miner.get_fan_config().await?)?
         );
@@ -1912,6 +3048,148 @@ mod tests {
         assert!(miner_data.timestamp > 0);
         assert!(!miner_data.schema_version.is_empty());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live miner; set MINER_IP"]
+    async fn restore_stock_os_support_live_test_auto_detect() -> anyhow::Result<()> {
+        let ip_str = std::env::var("MINER_IP").context("MINER_IP is not set")?;
+        let ip =
+            IpAddr::from_str(&ip_str).with_context(|| format!("invalid MINER_IP: {ip_str}"))?;
+
+        let miner = get_miner(ip, Arc::new(EPicFirmware::default()))
+            .await?
+            .context("no miner detected at MINER_IP")?;
+
+        anyhow::ensure!(
+            miner.supports_restore_stock_os(),
+            "miner does not advertise restore stock OS support"
+        );
+        println!("supports_restore_stock_os true");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "DESTRUCTIVE: restores stock OS; set MINER_IP"]
+    async fn restore_stock_os_live_test_auto_detect() -> anyhow::Result<()> {
+        let ip_str = std::env::var("MINER_IP").context("MINER_IP is not set")?;
+        let ip =
+            IpAddr::from_str(&ip_str).with_context(|| format!("invalid MINER_IP: {ip_str}"))?;
+
+        let miner = get_miner(ip, Arc::new(EPicFirmware::default()))
+            .await?
+            .context("no miner detected at MINER_IP")?;
+
+        anyhow::ensure!(
+            miner.supports_restore_stock_os(),
+            "miner does not advertise restore stock OS support"
+        );
+        let result = miner.restore_stock_os().await?;
+
+        println!("restore stock OS result: {result:?}");
+        assert!(result.accepted);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live miner and writes perpetual tune config; set MINER_IP and EPIC_TUNE_MODE=chiptune|powertune"]
+    async fn set_perpetual_tune_live_test() -> anyhow::Result<()> {
+        let ip_str = std::env::var("MINER_IP").context("MINER_IP is not set")?;
+        let ip =
+            IpAddr::from_str(&ip_str).with_context(|| format!("invalid MINER_IP: {ip_str}"))?;
+        let tune_mode = std::env::var("EPIC_TUNE_MODE")
+            .context("EPIC_TUNE_MODE is not set (expected chiptune or powertune)")?;
+
+        let miner = get_miner(ip, Arc::new(EPicFirmware::default()))
+            .await?
+            .context("no miner detected at MINER_IP")?;
+
+        let current_tuning = miner.get_tuning_config().await?;
+        let current_scaling = miner.get_scaling_config().await?;
+        println!(
+            "current perpetual tune settings: tuning={} scaling={}",
+            serde_json::to_string_pretty(&current_tuning)?,
+            serde_json::to_string_pretty(&current_scaling)?,
+        );
+
+        let target_tuning = match tune_mode.trim().to_ascii_lowercase().as_str() {
+            "chiptune" => {
+                let target = std::env::var("EPIC_HASHRATE_TARGET_TH")
+                    .unwrap_or_else(|_| "103".to_string())
+                    .parse::<f64>()
+                    .context("EPIC_HASHRATE_TARGET_TH must be a number in TH/s")?;
+                TuningConfig::new(TuningTarget::HashRate(HashRate {
+                    value: target,
+                    unit: HashRateUnit::TeraHash,
+                    algo: HashAlgorithm::SHA256,
+                }))
+                .with_algorithm("ChipTune")
+            }
+            "powertune" => {
+                let target = std::env::var("EPIC_POWER_TARGET_W")
+                    .unwrap_or_else(|_| "3000".to_string())
+                    .parse::<f64>()
+                    .context("EPIC_POWER_TARGET_W must be a number in watts")?;
+                TuningConfig::new(TuningTarget::Power(Power::from_watts(target)))
+            }
+            _ => anyhow::bail!(
+                "invalid EPIC_TUNE_MODE '{tune_mode}' (expected chiptune or powertune)"
+            ),
+        };
+
+        println!(
+            "target perpetual tune settings: tuning={} scaling={}",
+            serde_json::to_string_pretty(&target_tuning)?,
+            serde_json::to_string_pretty(&current_scaling)?,
+        );
+        anyhow::ensure!(
+            miner
+                .set_tuning_config(target_tuning, Some(current_scaling))
+                .await?,
+            "miner rejected the perpetual tune settings"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live miner and writes perpetual tune config; set MINER_IP"]
+    async fn set_scaling_config_live_test() -> anyhow::Result<()> {
+        let ip_str = std::env::var("MINER_IP").context("MINER_IP is not set")?;
+        let ip =
+            IpAddr::from_str(&ip_str).with_context(|| format!("invalid MINER_IP: {ip_str}"))?;
+
+        let miner = get_miner(ip, Arc::new(EPicFirmware::default()))
+            .await?
+            .context("no miner detected at MINER_IP")?;
+
+        let original_tuning = miner.get_tuning_config().await?;
+        let original_scaling = miner.get_scaling_config().await?;
+        println!(
+            "original: tuning={} scaling={}",
+            serde_json::to_string_pretty(&original_tuning)?,
+            serde_json::to_string_pretty(&original_scaling)?,
+        );
+
+        let target = ScalingConfig::new(original_scaling.step + 1, original_scaling.minimum);
+        anyhow::ensure!(
+            miner.set_scaling_config(target).await?,
+            "miner rejected the scaling config"
+        );
+
+        // The tuning target must survive a scaling-only write. Compared as JSON
+        // because TuningConfig is not PartialEq.
+        let before = serde_json::to_string(&original_tuning)?;
+        let after = serde_json::to_string(&miner.get_tuning_config().await?)?;
+        anyhow::ensure!(
+            before == after,
+            "scaling write changed the tuning target: {before} -> {after}"
+        );
+
+        miner.set_scaling_config(original_scaling).await?;
         Ok(())
     }
 
@@ -1965,6 +3243,68 @@ mod tests {
 
             assert_eq!(updated_pool.password, expected.password);
         }
+
+        Ok(())
+    }
+
+    /// Builds a collector over the v1 fixtures with `capabilities` overridden,
+    /// then returns whatever `parse_serial_number` makes of it.
+    async fn serial_number_for(capabilities: Value) -> Option<String> {
+        let miner = PowerPlayV1::new(IpAddr::from([127, 0, 0, 1]), AntMinerModel::S19XP);
+
+        let mut results = HashMap::new();
+        results.insert(
+            MinerCommand::WebAPI {
+                command: "capabilities",
+                parameters: None,
+            },
+            capabilities,
+        );
+
+        let mock_api = MockAPIClient::new(results);
+        let mut collector = DataCollector::new_with_client(&miner, &mock_api);
+        let data = collector.collect(&[DataField::SerialNumber]).await;
+
+        miner.parse_serial_number(&data)
+    }
+
+    #[tokio::test]
+    async fn serial_number_prefers_the_miner_serial() -> anyhow::Result<()> {
+        let mut capabilities = Value::from_str(CAPABILITIES)?;
+        capabilities["Miner Serial Number"] = Value::from("YDFTDXUBBJDJH067C");
+
+        assert_eq!(
+            serial_number_for(capabilities).await,
+            Some("YDFTDXUBBJDJH067C".to_string())
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn serial_number_falls_back_when_miner_serial_is_absent() -> anyhow::Result<()> {
+        // The stock fixture carries no `Miner Serial Number` key at all.
+        let capabilities = Value::from_str(CAPABILITIES)?;
+        assert!(capabilities.get("Miner Serial Number").is_none());
+
+        assert_eq!(
+            serial_number_for(capabilities).await,
+            Some("002000353232510933363631".to_string())
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn serial_number_falls_back_when_miner_serial_is_null() -> anyhow::Result<()> {
+        // The common case in the field: the key is present but explicitly null.
+        let mut capabilities = Value::from_str(CAPABILITIES)?;
+        capabilities["Miner Serial Number"] = Value::Null;
+
+        assert_eq!(
+            serial_number_for(capabilities).await,
+            Some("002000353232510933363631".to_string())
+        );
 
         Ok(())
     }

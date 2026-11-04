@@ -7,6 +7,8 @@ use std::{
 #[cfg(feature = "python")]
 use asic_rs_pydantic::py_to_string;
 use measurements::Power;
+
+use crate::data::device::HashAlgorithm;
 #[cfg(feature = "python")]
 use pyo3::{
     exceptions::PyValueError,
@@ -14,10 +16,11 @@ use pyo3::{
     types::{PyAnyMethods, PyType},
 };
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 #[cfg_attr(feature = "python", pyclass(from_py_object, module = "asic_rs"))]
 #[cfg_attr(feature = "python", derive(asic_rs_pydantic::PyPydanticEnum))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, TS)]
 /// Unit used to represent a [`HashRate`] value.
 pub enum HashRateUnit {
     /// Hashes per second.
@@ -48,6 +51,12 @@ pub enum HashRateUnit {
     /// Yottahashes per second.
     #[cfg_attr(feature = "python", pydantic(value = "YH/s"))]
     YottaHash,
+    /// Equihash solutions per second.
+    #[cfg_attr(feature = "python", pydantic(value = "Sol/s"))]
+    Sol,
+    /// Thousands of Equihash solutions per second.
+    #[cfg_attr(feature = "python", pydantic(value = "KSol/s"))]
+    KiloSol,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,8 +75,8 @@ impl std::error::Error for HashRateUnitParseError {}
 impl HashRateUnit {
     fn to_multiplier(self) -> u128 {
         match self {
-            HashRateUnit::Hash => 1,
-            HashRateUnit::KiloHash => 1_000,
+            HashRateUnit::Hash | HashRateUnit::Sol => 1,
+            HashRateUnit::KiloHash | HashRateUnit::KiloSol => 1_000,
             HashRateUnit::MegaHash => 1_000_000,
             HashRateUnit::GigaHash => 1_000_000_000,
             HashRateUnit::TeraHash => 1_000_000_000_000,
@@ -88,6 +97,10 @@ impl FromStr for HashRateUnit {
         match normalized.as_str() {
             "HASH" | "H" | "HS" | "H/S" => Ok(HashRateUnit::Hash),
             "KILOHASH" | "KH" | "KHS" | "KH/S" => Ok(HashRateUnit::KiloHash),
+            "SOL" | "SOLS" | "SOL/S" => Ok(HashRateUnit::Sol),
+            "KILOSOL" | "KILOSOLS" | "KILOSOL/S" | "KSOL" | "KSOLS" | "KSOL/S" => {
+                Ok(HashRateUnit::KiloSol)
+            }
             "MEGAHASH" | "MH" | "MHS" | "MH/S" => Ok(HashRateUnit::MegaHash),
             "GIGAHASH" | "GH" | "GHS" | "GH/S" => Ok(HashRateUnit::GigaHash),
             "TERAHASH" | "TH" | "THS" | "TH/S" => Ok(HashRateUnit::TeraHash),
@@ -107,6 +120,8 @@ impl Display for HashRateUnit {
         match self {
             HashRateUnit::Hash => write!(f, "H/s"),
             HashRateUnit::KiloHash => write!(f, "KH/s"),
+            HashRateUnit::Sol => write!(f, "Sol/s"),
+            HashRateUnit::KiloSol => write!(f, "KSol/s"),
             HashRateUnit::MegaHash => write!(f, "MH/s"),
             HashRateUnit::GigaHash => write!(f, "GH/s"),
             HashRateUnit::TeraHash => write!(f, "TH/s"),
@@ -121,11 +136,42 @@ impl Display for HashRateUnit {
 #[cfg(feature = "python")]
 #[pymethods]
 impl HashRateUnit {
+    /// Compare against another [`HashRateUnit`] or against its rendered name
+    /// (`"TH/s"`). See `HashAlgorithm::__eq__` for why the string form is
+    /// accepted.
+    fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
+        if let Ok(other) = other.extract::<HashRateUnit>() {
+            return *self == other;
+        }
+        other
+            .extract::<String>()
+            .is_ok_and(|name| name == self.to_string())
+    }
+
+    fn __ne__(&self, other: &Bound<'_, PyAny>) -> bool {
+        !self.__eq__(other)
+    }
+
+    /// Defining `__eq__` drops the inherited hash, so restore it explicitly.
+    fn __hash__(&self) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish()
+    }
+
     #[classattr]
     const H: Self = Self::Hash;
 
     #[classattr]
     const KH: Self = Self::KiloHash;
+
+    #[classattr]
+    const SOL: Self = Self::Sol;
+
+    #[classattr]
+    const KSOL: Self = Self::KiloSol;
 
     #[classattr]
     const MH: Self = Self::MegaHash;
@@ -181,7 +227,7 @@ impl HashRateUnit {
     pyclass(from_py_object, get_all, module = "asic_rs")
 )]
 #[cfg_attr(feature = "python", asic_rs_pydantic::py_pydantic_model)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 /// Hashrate value with unit and mining algorithm.
 pub struct HashRate {
     /// The current amount of hashes being computed
@@ -190,10 +236,16 @@ pub struct HashRate {
     #[cfg_attr(feature = "python", pydantic_data(to_string))]
     pub unit: HashRateUnit,
     /// The algorithm of the computed hashes
-    pub algo: String,
+    #[cfg_attr(feature = "python", pydantic_data(to_string))]
+    pub algo: HashAlgorithm,
 }
 
 impl HashRate {
+    /// Return the conventional display unit for this hashrate's algorithm.
+    pub const fn default_unit(&self) -> HashRateUnit {
+        self.algo.default_hashrate_unit()
+    }
+
     /// Return this hashrate converted into another unit.
     pub fn as_unit(self, unit: HashRateUnit) -> Self {
         let base = self.value * self.unit.to_multiplier() as f64; // Convert to base unit.
@@ -203,6 +255,12 @@ impl HashRate {
             unit,
             algo: self.algo,
         }
+    }
+
+    /// Return this hashrate converted into the conventional unit for its algorithm.
+    pub fn as_default_unit(self) -> Self {
+        let unit = self.default_unit();
+        self.as_unit(unit)
     }
 }
 
@@ -216,13 +274,19 @@ impl HashRate {
         unit: Option<HashRateUnit>,
         algo: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
+        let algo = algo
+            .map(|algo| {
+                let name = py_to_string(algo)?;
+                HashAlgorithm::from_str(&name)
+                    .map_err(|_| PyValueError::new_err(format!("unknown hash algorithm: {name}")))
+            })
+            .transpose()?
+            .unwrap_or(HashAlgorithm::SHA256);
+
         Ok(Self {
             value,
-            unit: unit.unwrap_or_default(),
-            algo: algo
-                .map(py_to_string)
-                .transpose()?
-                .unwrap_or_else(|| "SHA256".to_string()),
+            unit: unit.unwrap_or_else(|| algo.default_hashrate_unit()),
+            algo,
         })
     }
 
@@ -235,6 +299,17 @@ impl HashRate {
     #[pyo3(signature = (unit: "HashRateUnit"))]
     pub fn py_as_unit(&self, unit: HashRateUnit) -> Self {
         self.into_unit(unit)
+    }
+
+    /// Return the conventional display unit for this hashrate's algorithm.
+    #[pyo3(name = "default_unit")]
+    fn py_default_unit(&self) -> HashRateUnit {
+        self.default_unit()
+    }
+
+    /// Return this hashrate converted into the conventional unit for its algorithm.
+    pub fn into_default_unit(&self) -> Self {
+        self.clone().as_default_unit()
     }
 
     fn __float__(&self) -> f64 {
@@ -282,5 +357,48 @@ impl Div<HashRate> for Power {
 
     fn div(self, hash_rate: HashRate) -> Self::Output {
         self.as_watts() / hash_rate.value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn as_default_unit_uses_the_algorithm() {
+        let hashrate = HashRate {
+            value: 16_200.0,
+            unit: HashRateUnit::MegaHash,
+            algo: HashAlgorithm::Scrypt,
+        }
+        .as_default_unit();
+
+        assert_eq!(hashrate.unit, HashRateUnit::GigaHash);
+        assert_eq!(hashrate.value, 16.2);
+        assert_eq!(hashrate.to_string(), "16.2 GH/s");
+    }
+
+    #[test]
+    fn equihash_uses_solution_units() {
+        let hashrate = HashRate {
+            value: 150_725.63,
+            unit: HashRateUnit::Hash,
+            algo: HashAlgorithm::Equihash,
+        }
+        .as_default_unit();
+
+        assert_eq!(hashrate.unit, HashRateUnit::KiloSol);
+        assert!((hashrate.value - 150.72563).abs() < 1e-9);
+        assert_eq!(hashrate.to_string(), "150.72563 KSol/s");
+        assert_eq!(
+            hashrate.clone().as_unit(HashRateUnit::Sol).value,
+            150_725.63
+        );
+        assert_eq!(HashRateUnit::from_str("ksol/s"), Ok(HashRateUnit::KiloSol));
+        assert_eq!(HashRateUnit::from_str("Sol/s"), Ok(HashRateUnit::Sol));
+        assert_eq!(
+            serde_json::to_string(&hashrate.unit).unwrap(),
+            "\"KiloSol\""
+        );
     }
 }

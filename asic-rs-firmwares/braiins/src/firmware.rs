@@ -1,7 +1,11 @@
 use std::{fmt, fmt::Display, net::IpAddr};
 
+use asic_rs_core::traits::model::MinerModelAlgorithm;
 use asic_rs_core::{
-    data::{command::MinerCommand, device::MinerHardware},
+    data::{
+        command::DiscoveryCommand,
+        device::{HashAlgorithm, MinerHardware},
+    },
     discovery::{HTTP_WEB_ROOT, RPC_VERSION},
     errors::ModelSelectionError,
     traits::{
@@ -63,6 +67,16 @@ impl MinerModel for BraiinsCompatibleModel {
     }
 }
 
+impl MinerModelAlgorithm for BraiinsCompatibleModel {
+    fn hash_algorithm(&self) -> HashAlgorithm {
+        match self {
+            Self::AntMiner(m) => m.hash_algorithm(),
+            Self::Braiins(m) => m.hash_algorithm(),
+            Self::Unknown(m) => m.hash_algorithm(),
+        }
+    }
+}
+
 #[derive(Default, Debug)]
 pub struct BraiinsFirmware {}
 
@@ -73,14 +87,16 @@ impl Display for BraiinsFirmware {
 }
 
 impl DiscoveryCommands for BraiinsFirmware {
-    fn get_discovery_commands(&self) -> Vec<MinerCommand> {
+    fn get_discovery_commands(&self) -> Vec<DiscoveryCommand> {
         vec![RPC_VERSION, HTTP_WEB_ROOT]
     }
 }
 
 #[async_trait]
 impl MinerFirmware for BraiinsFirmware {
-    async fn get_model(ip: IpAddr) -> Result<impl MinerModel + Send, ModelSelectionError> {
+    type Model = BraiinsCompatibleModel;
+
+    async fn get_model(ip: IpAddr) -> Result<Self::Model, ModelSelectionError> {
         if let Some(json_data) =
             util::send_graphql_command(&ip, "{ bosminer { info { modelName } } }").await
             && let Some(model_str) = json_data["data"]["bosminer"]["info"]["modelName"].as_str()
@@ -116,27 +132,7 @@ impl MinerFirmware for BraiinsFirmware {
 
         let full = response["data"]["bos"]["info"]["version"]["full"].as_str()?;
 
-        let version_str = full.split('-').rev().find(|s| s.contains('.'))?;
-
-        let normalized = version_str
-            .split('.')
-            .map(|part| part.trim_start_matches('0').to_string())
-            .map(|part| {
-                if part.is_empty() {
-                    "0".to_string()
-                } else {
-                    part
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(".");
-
-        // pad if needed, semver requires major.minor.patch
-        let padded = match version_str.split('.').count() {
-            2 => format!("{}.0", normalized),
-            _ => normalized.to_string(),
-        };
-        semver::Version::parse(&padded).ok()
+        crate::backends::util::parse_bos_version(full)
     }
 }
 
@@ -164,5 +160,87 @@ impl FirmwareEntry for BraiinsFirmware {
             miner.set_auth(auth.clone());
         }
         Ok(miner)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{str::FromStr, sync::Arc};
+
+    use anyhow::Context;
+    use asic_rs_core::test::util::get_miner;
+
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires live miner; set MINER_IP"]
+    async fn parse_data_live_test_auto_detect() -> anyhow::Result<()> {
+        let ip_str = std::env::var("MINER_IP").context("MINER_IP is not set")?;
+        let ip =
+            IpAddr::from_str(&ip_str).with_context(|| format!("invalid MINER_IP: {ip_str}"))?;
+
+        let miner = get_miner(ip, Arc::new(BraiinsFirmware::default()))
+            .await?
+            .context("no miner detected at MINER_IP")?;
+        let miner_data = miner.get_data().await;
+        let mut miner_data_print = miner_data.clone();
+        for hashboard in &mut miner_data_print.hashboards {
+            hashboard.chips.clear();
+        }
+        println!("data {}", serde_json::to_string_pretty(&miner_data_print)?);
+
+        println!(
+            "pools {}",
+            serde_json::to_string_pretty(&miner.get_pools_config().await?)?
+        );
+
+        assert_eq!(miner_data.ip, ip);
+        assert!(miner_data.timestamp > 0);
+        assert!(!miner_data.schema_version.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live miner; set MINER_IP"]
+    async fn restore_stock_os_support_live_test_auto_detect() -> anyhow::Result<()> {
+        let ip_str = std::env::var("MINER_IP").context("MINER_IP is not set")?;
+        let ip =
+            IpAddr::from_str(&ip_str).with_context(|| format!("invalid MINER_IP: {ip_str}"))?;
+
+        let miner = get_miner(ip, Arc::new(BraiinsFirmware::default()))
+            .await?
+            .context("no miner detected at MINER_IP")?;
+
+        anyhow::ensure!(
+            miner.supports_restore_stock_os(),
+            "miner does not advertise restore stock OS support"
+        );
+        println!("supports_restore_stock_os true");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "DESTRUCTIVE: restores stock OS; set MINER_IP"]
+    async fn restore_stock_os_live_test_auto_detect() -> anyhow::Result<()> {
+        let ip_str = std::env::var("MINER_IP").context("MINER_IP is not set")?;
+        let ip =
+            IpAddr::from_str(&ip_str).with_context(|| format!("invalid MINER_IP: {ip_str}"))?;
+
+        let miner = get_miner(ip, Arc::new(BraiinsFirmware::default()))
+            .await?
+            .context("no miner detected at MINER_IP")?;
+
+        anyhow::ensure!(
+            miner.supports_restore_stock_os(),
+            "miner does not advertise restore stock OS support"
+        );
+        let result = miner.restore_stock_os().await?;
+
+        println!("restore stock OS result: {result:?}");
+        assert!(result.accepted);
+
+        Ok(())
     }
 }

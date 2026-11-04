@@ -6,11 +6,21 @@ use anyhow::{Context, Result, anyhow, bail};
 use asic_rs_core::data::firmware::FirmwareImage;
 use asic_rs_core::{data::command::MinerCommand, traits::miner::*};
 use async_trait::async_trait;
+use digest_auth::{AuthContext, HttpMethod};
 use diqwest::WithDigestAuth;
-use reqwest::{Client, Method, Response, multipart};
+use reqwest::{
+    Client, Method, Response, StatusCode,
+    header::{AUTHORIZATION, HeaderValue, WWW_AUTHENTICATE},
+    multipart,
+};
 use serde_json::{Value, json};
 
 use super::firmware::AntMinerFirmwareUpgradeResponseExt;
+
+/// `set_miner_conf.cgi` restarts mining before it answers, which takes about
+/// a minute on stock firmware. Giving up sooner reports a failure for a write
+/// the miner has already applied.
+const SET_MINER_CONF_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
 pub struct AntMinerWebAPI {
@@ -43,6 +53,54 @@ impl AntMinerWebAPI {
         Ok(multipart::Form::new().part("firmware", part))
     }
 
+    fn build_firmware_upload_authorization(&self, challenge: &str) -> Result<HeaderValue> {
+        let context = AuthContext::new_with_method(
+            self.auth.username(),
+            self.auth.password(),
+            "/cgi-bin/upgrade.cgi",
+            None::<&[u8]>,
+            HttpMethod::POST,
+        );
+        let authorization = digest_auth::parse(challenge)
+            .context("failed to parse firmware upload digest challenge")?
+            .respond(&context)
+            .context("failed to answer firmware upload digest challenge")?;
+
+        HeaderValue::from_str(&authorization.to_header_string())
+            .context("failed to encode firmware upload authorization header")
+    }
+
+    async fn firmware_upload_authorization(&self) -> Result<Option<HeaderValue>> {
+        let url = format!("http://{}:{}/cgi-bin/upgrade.cgi", self.ip, self.port);
+        let response = self
+            .client()?
+            .get(url)
+            .timeout(self.timeout)
+            .send()
+            .await
+            .context("failed to request firmware upload digest challenge")?;
+
+        if response.status().is_success() {
+            return Ok(None);
+        }
+        if response.status() != StatusCode::UNAUTHORIZED {
+            bail!(
+                "firmware upload digest challenge failed with status code {}",
+                response.status()
+            );
+        }
+
+        let challenge = response
+            .headers()
+            .get(WWW_AUTHENTICATE)
+            .context("firmware upload digest challenge response is missing WWW-Authenticate")?
+            .to_str()
+            .context("firmware upload digest challenge is not valid text")?;
+
+        self.build_firmware_upload_authorization(challenge)
+            .map(Some)
+    }
+
     pub fn new(ip: IpAddr, auth: MinerAuth) -> Self {
         Self {
             ip,
@@ -51,6 +109,13 @@ impl AntMinerWebAPI {
             timeout: Duration::from_secs(5),
             auth,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_with_port(ip: IpAddr, port: u16, auth: MinerAuth) -> Self {
+        let mut client = Self::new(ip, auth);
+        client.port = port;
+        client
     }
 
     pub fn set_auth(&mut self, auth: MinerAuth) {
@@ -113,7 +178,13 @@ impl AntMinerWebAPI {
             let json_data = response.json().await.map_err(|e| anyhow!(e.to_string()))?;
             Ok(json_data)
         } else {
-            bail!("HTTP request failed with status code {}", status);
+            // Keep whatever the miner said about why it refused the request.
+            let body = response.text().await.unwrap_or_default();
+            let body = Self::truncated_firmware_upgrade_response_body(body.trim());
+            if body.is_empty() {
+                bail!("HTTP request failed with status code {}", status);
+            }
+            bail!("HTTP request failed with status code {}: {}", status, body);
         }
     }
 
@@ -192,13 +263,17 @@ impl AntMinerWebAPI {
             .await
     }
 
+    fn set_miner_conf_timeout(&self) -> Duration {
+        self.timeout.max(SET_MINER_CONF_TIMEOUT)
+    }
+
     pub async fn set_miner_conf(&self, conf: Value) -> Result<Value> {
         self.send_web_command_with_timeout(
             "set_miner_conf",
             false,
             Some(conf),
             Method::POST,
-            self.timeout.max(Duration::from_secs(30)),
+            self.set_miner_conf_timeout(),
         )
         .await
     }
@@ -213,9 +288,33 @@ impl AntMinerWebAPI {
             .await
     }
 
-    pub async fn reboot(&self) -> Result<Value> {
-        self.send_web_command("reboot", false, None, Method::POST)
+    /// Reboot the miner.
+    ///
+    /// The firmware's own web UI issues a plain `GET` with a 30 second timeout
+    /// and accepts any successful status, so the response is not read as JSON.
+    pub async fn reboot(&self) -> Result<()> {
+        let url = format!("http://{}:{}/cgi-bin/reboot.cgi", self.ip, self.port);
+        let response = self
+            .execute_web_request(
+                &url,
+                &Method::GET,
+                None,
+                self.timeout.max(Duration::from_secs(30)),
+            )
             .await
+            .context("reboot request failed")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            bail!(
+                "reboot failed with status code {}: {}",
+                status,
+                Self::truncated_firmware_upgrade_response_body(body.trim())
+            );
+        }
+
+        Ok(())
     }
 
     pub async fn read_logs(&self) -> Result<String> {
@@ -242,13 +341,21 @@ impl AntMinerWebAPI {
     pub async fn upgrade_firmware(&self, image: FirmwareImage) -> Result<()> {
         let url = format!("http://{}:{}/cgi-bin/upgrade.cgi", self.ip, self.port);
         let form = Self::build_firmware_upload_form(image)?;
+        let authorization = self.firmware_upload_authorization().await?;
 
-        let response = self
+        let mut request = self
             .client()?
             .post(url)
             .multipart(form)
-            .timeout(self.timeout.max(Duration::from_secs(60)))
-            .send_digest_auth((self.auth.username(), self.auth.password()))
+            .timeout(self.timeout.max(Duration::from_secs(60)));
+        if let Some(authorization) = authorization {
+            request = request.header(AUTHORIZATION, authorization);
+        }
+
+        // Multipart bodies are streams and cannot be cloned by diqwest's challenge/response
+        // flow. Authenticate the single upload request with the challenge obtained above.
+        let response = request
+            .send()
             .await
             .with_context(|| "firmware upload HTTP request failed".to_string())?;
 
@@ -342,5 +449,44 @@ impl WebAPIClient for AntMinerWebAPI {
     ) -> Result<Value> {
         self.send_web_command(command, privileged, parameters, method)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_digest_authorization_for_firmware_upload_endpoint() {
+        let web = AntMinerWebAPI::new(
+            "127.0.0.1".parse().unwrap(),
+            MinerAuth::new("root", "secret"),
+        );
+        let authorization = web
+            .build_firmware_upload_authorization(
+                r#"Digest realm="antMiner Configuration", nonce="0123456789", qop="auth""#,
+            )
+            .unwrap();
+        let authorization = authorization.to_str().unwrap();
+
+        assert!(authorization.starts_with("Digest "));
+        assert!(authorization.contains(r#"username="root""#));
+        assert!(authorization.contains(r#"uri="/cgi-bin/upgrade.cgi""#));
+        assert!(authorization.contains("qop=auth"));
+    }
+
+    #[test]
+    fn config_write_waits_longer_than_a_read() {
+        let ip = "127.0.0.1".parse().unwrap();
+        let auth = MinerAuth::new("root", "secret");
+
+        // The CGI answers only after restarting mining, about a minute.
+        let web = AntMinerWebAPI::new(ip, auth.clone());
+        assert_eq!(web.timeout, Duration::from_secs(5));
+        assert_eq!(web.set_miner_conf_timeout(), Duration::from_secs(120));
+
+        // A caller that asked for longer still gets it.
+        let web = AntMinerWebAPI::with_timeout(ip, Duration::from_secs(300), auth);
+        assert_eq!(web.set_miner_conf_timeout(), Duration::from_secs(300));
     }
 }

@@ -169,7 +169,10 @@ impl APIClient for ElphapexV1 {
     async fn get_api_result(&self, command: &MinerCommand) -> Result<Value> {
         match command {
             MinerCommand::WebAPI { .. } => self.web.get_api_result(command).await,
-            _ => Err(anyhow::anyhow!("Unsupported command type for Elphapex")),
+            _ => Err(anyhow::anyhow!(
+                "Unsupported command type for {}",
+                ElphapexStockFirmware::default()
+            )),
         }
     }
 }
@@ -512,7 +515,7 @@ impl GetHashboards for ElphapexV1 {
                 .map(|rate| HashRate {
                     value: rate,
                     unit,
-                    algo: "Scrypt".to_string(),
+                    algo: self.device_info.algo,
                 });
             board.expected_hashrate =
                 chain
@@ -521,7 +524,7 @@ impl GetHashboards for ElphapexV1 {
                     .map(|rate| HashRate {
                         value: rate,
                         unit,
-                        algo: "Scrypt".to_string(),
+                        algo: self.device_info.algo,
                     });
             board.working_chips = chain
                 .get("asic_num")
@@ -579,7 +582,7 @@ impl GetHashrate for ElphapexV1 {
         Some(HashRate {
             value: rate,
             unit,
-            algo: "Scrypt".to_string(),
+            algo: self.device_info.algo,
         })
     }
 }
@@ -604,7 +607,7 @@ impl GetExpectedHashrate for ElphapexV1 {
         Some(HashRate {
             value: rate,
             unit,
-            algo: "Scrypt".to_string(),
+            algo: self.device_info.algo,
         })
     }
 }
@@ -642,6 +645,7 @@ impl GetFans for ElphapexV1 {
 }
 
 impl GetPsuFans for ElphapexV1 {}
+impl GetPsus for ElphapexV1 {}
 impl GetFluidTemperature for ElphapexV1 {}
 impl GetWattage for ElphapexV1 {
     fn parse_wattage(&self, data: &HashMap<DataField, Value>) -> Option<Power> {
@@ -706,8 +710,10 @@ impl GetMessages for ElphapexV1 {
                 let message = status
                     .get("msg")
                     .and_then(Value::as_str)
-                    .unwrap_or("Elphapex status warning")
-                    .to_string();
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        format!("{} status warning", ElphapexStockFirmware::default())
+                    });
                 Some(MinerMessage {
                     timestamp,
                     code: 0,
@@ -734,6 +740,13 @@ impl GetUptime for ElphapexV1 {
             .map(Duration::from_secs)
     }
 }
+
+impl GetBestShare for ElphapexV1 {}
+impl GetSessionBestShare for ElphapexV1 {}
+
+impl GetOperatingState for ElphapexV1 {}
+
+impl GetDevFeeConnected for ElphapexV1 {}
 
 impl GetIsMining for ElphapexV1 {
     fn parse_is_mining(&self, data: &HashMap<DataField, Value>) -> bool {
@@ -801,6 +814,9 @@ impl GetPools for ElphapexV1 {
                         .map(|url| PoolURL::from(url.to_string())),
                     accepted_shares: pool.get("accepted").and_then(Self::parse_u64),
                     rejected_shares: pool.get("rejected").and_then(Self::parse_u64),
+                    last_share_time: pool
+                        .get("lstime")
+                        .and_then(asic_rs_core::util::parse_last_share_time),
                     active: raw_index.map(|index| Some(index) == active_index).or(alive),
                     alive,
                     user: pool
@@ -891,6 +907,9 @@ impl FactoryReset for ElphapexV1 {
         false
     }
 }
+
+impl RestartMining for ElphapexV1 {}
+impl RestoreStockOs for ElphapexV1 {}
 
 #[async_trait]
 impl SupportsPoolsConfig for ElphapexV1 {
@@ -1000,7 +1019,11 @@ impl SupportsScalingConfig for ElphapexV1 {
 impl SupportsTuningConfig for ElphapexV1 {}
 impl SupportsFanConfig for ElphapexV1 {}
 impl SupportsTemperatureConfig for ElphapexV1 {}
+impl SupportsPresets for ElphapexV1 {}
+impl SupportsTimezoneConfig for ElphapexV1 {}
 impl UpgradeFirmware for ElphapexV1 {}
+impl SetHashboardsEnabled for ElphapexV1 {}
+
 impl SetTuningPercent for ElphapexV1 {}
 
 impl HasDefaultAuth for ElphapexV1 {
